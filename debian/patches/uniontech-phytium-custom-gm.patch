@@ -1,0 +1,3528 @@
+---
+ Configure                       |    2 
+ crypto/provider_predefined.c    |    6 
+ providers/build.info            |    9 
+ providers/phytium/build.info    |    1 
+ providers/phytium/phytiumprov.c |  182 +++++++
+ providers/phytium/scto.c        |  375 ++++++++++++++++
+ providers/phytium/scto.h        |   94 ++++
+ providers/phytium/sm2_phytium.c |  662 ++++++++++++++++++++++++++++
+ providers/phytium/sm2_phytium.h |   53 ++
+ providers/phytium/sm3_phytium.c |  634 +++++++++++++++++++++++++++
+ providers/phytium/sm3_phytium.h |   41 +
+ providers/phytium/sm4_phytium.c |  919 ++++++++++++++++++++++++++++++++++++++++
+ providers/phytium/sm4_phytium.h |  111 ++++
+ providers/phytium/smx_common.h  |  313 +++++++++++++
+ 14 files changed, 3402 insertions(+)
+
+Index: b/Configure
+===================================================================
+--- a/Configure
++++ b/Configure
+@@ -476,6 +476,7 @@ my @disablables = (
+     "multiblock",
+     "nextprotoneg",
+     "ntls",
++    "phytiumgm",
+     "ocb",
+     "ocsp",
+     "padlockeng",
+@@ -586,6 +587,7 @@ our %disabled = ( # "what"         => "c
+                   "zlib-dynamic"        => "default",
+                   "zstd"                => "default",
+                   "zstd-dynamic"        => "default",
++                  "phytiumgm"           => "default",
+                 );
+ 
+ # Note: => pair form used for aesthetics, not to truly make a hash table
+Index: b/providers/build.info
+===================================================================
+--- a/providers/build.info
++++ b/providers/build.info
+@@ -168,6 +168,15 @@ IF[{- !$disabled{legacy} -}]
+   INCLUDE[$LEGACYGOAL]=../include implementations/include common/include
+ ENDIF
+ 
++IF[{- !$disabled{phytiumgm} -}]
++  SUBDIRS=phytium
++  $LIBPHYTIUMGM=libphytiumgm.a
++  LIBS{noinst}=$LIBPHYTIUMGM
++  INCLUDE[$LIBPHYTIUMGM]=.. $COMMON_INCLUDES
++  DEPEND[$LIBDEFAULT]=$LIBPHYTIUMGM
++
++ENDIF
++
+ #
+ # Null provider stuff
+ #
+Index: b/crypto/provider_predefined.c
+===================================================================
+--- a/crypto/provider_predefined.c
++++ b/crypto/provider_predefined.c
+@@ -17,6 +17,9 @@ OSSL_provider_init_fn ossl_fips_intern_p
+ #ifdef STATIC_LEGACY
+ OSSL_provider_init_fn ossl_legacy_provider_init;
+ #endif
++#ifdef HOST_ARCH_ARM64
++OSSL_provider_init_fn ossl_scto_provider_init;
++#endif
+ const OSSL_PROVIDER_INFO ossl_predefined_providers[] = {
+ #ifdef FIPS_MODULE
+     { "fips", NULL, ossl_fips_intern_provider_init, NULL, 1 },
+@@ -25,6 +28,9 @@ const OSSL_PROVIDER_INFO ossl_predefined
+ # ifdef STATIC_LEGACY
+     { "legacy", NULL, ossl_legacy_provider_init, NULL, 0 },
+ # endif
++#ifdef HOST_ARCH_ARM64
++    { "scto", NULL, ossl_scto_provider_init, NULL, 0 },
++#endif
+     { "base", NULL, ossl_base_provider_init, NULL, 0 },
+     { "null", NULL, ossl_null_provider_init, NULL, 0 },
+ #endif
+Index: b/providers/phytium/build.info
+===================================================================
+--- /dev/null
++++ b/providers/phytium/build.info
+@@ -0,0 +1 @@
++SOURCE[../libphytiumgm.a]=phytiumprov.c sm3_phytium.c sm4_phytium.c scto.c
+\ No newline at end of file
+Index: b/providers/phytium/smx_common.h
+===================================================================
+--- /dev/null
++++ b/providers/phytium/smx_common.h
+@@ -0,0 +1,313 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LIB_SMX_COMMON_H_
++#define _LIB_SMX_COMMON_H_
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <string.h>
++#include <err.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/time.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <pthread.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <openssl/core.h>
++#include <openssl/crypto.h>
++
++
++
++#define SCTO_ENABLE_SMALL_PACKKET_CIPHER_OFFLOADS 1
++
++//256, 512, 1024, 2048, 4096, 8192, 16384, 32768
++#define SCTO_DESC_NUM (256)
++//256,4096, 8192, 16384, 32768, 65536
++#define PER_DESC_DMA_BUF_SIZE (65536)
++
++#define D2000 (1)
++
++#define PHYTIUM_SM3_DMA_SIZE (PER_DESC_DMA_BUF_SIZE)
++
++#ifdef D2000
++#define PHYTIUM_SM4_DMA_SIZE (PER_DESC_DMA_BUF_SIZE)
++#else
++#define PHYTIUM_SM4_DMA_SIZE (0x100)
++#endif
++
++#define MAGIC_NUM 'p'
++#define SCTO_SM3 _IO(MAGIC_NUM, 0)
++#define SCTO_SM4 _IO(MAGIC_NUM, 1)
++#define SCTO_SM2 _IO(MAGIC_NUM, 2)
++
++#define unlikely(x) (__builtin_expect(!!(x), 0))
++#define likely(x) (__builtin_expect(!!(x), 1))
++
++#define SM3_BLOCK_BYTE_LEN    (64)
++
++# ifndef SM3_BLOCK_SIZE
++#  define SM3_BLOCK_SIZE   64
++# endif
++
++# ifndef SM3_DIGEST_LENGTH
++#  define SM3_DIGEST_LENGTH   32
++# endif
++
++# ifndef SM4_KEY_SIZE
++#  define SM4_KEY_SIZE   16
++# endif
++
++# ifndef SM4_BLOCK_SIZE
++#  define SM4_BLOCK_SIZE   16
++# endif
++
++# ifndef SM4_IV_LEN
++# define SM4_IV_LEN 16
++# endif
++
++#define SKE_MODE_OFFSET           (9)
++#define SKE_CRYPTO_OFFSET         (8)
++#define SKE_UPDATE_IV_OFFSET      (18)
++#define SKE_ERR_CFG_OFFSET        (8)
++
++#define SM4_BLOCK_BYTE_LEN  (16)
++#define SM4_BLOCK_WORD_LEN  (4)
++#define SM4_KEY_BYTE_LEN    (16)
++#define SM4_KEY_WORD_LEN    (4)
++
++typedef enum {
++	SM4_MODE_ECB = 0,
++	SM4_MODE_CBC,
++	SM4_MODE_CFB,
++	SM4_MODE_OFB,
++	SM4_MODE_CTR,
++} sm4_mode_e;
++
++typedef enum {
++	SM4_CRYPTO_ENCRYPT = 0,
++	SM4_CRYPTO_DECRYPT,
++} sm4_crypto_e;
++
++extern const OSSL_DISPATCH phytium_sm4_functions[];
++
++//int phytium_scto_sm4_init(int *desc_id, uint32_t mode, uint32_t cryptomode, const uint8_t *key, const uint8_t*iv);
++//int phytium_scto_sm4_update(int desc_id, const uint8_t *in, uint32_t len, uint8_t *out);
++
++struct _sm4_context {
++	uint32_t encsk[32]; /* SM4 subkeys */
++	uint32_t decsk[32]; /* SM4 subkeys */
++};
++
++
++/*SM3 digest and block length*/
++#define SM3_DIGEST_WORD_LEN   (8)
++#define SM3_DIGEST_BYTE_LEN   (32)
++#define SM3_BLOCK_WORD_LEN    (16)
++#define SM3_BLOCK_BYTE_LEN    (64)
++
++extern const OSSL_DISPATCH phytium_sm3_functions[];
++
++/* HMAC-SM3状态定义 */
++enum HMAC_SM3_STATE {
++	HMAC_SM3_STATE_INITIALIZED = 0,		// 初始化
++	HMAC_SM3_STATE_KEY_SET,			// 密钥已设置
++	HMAC_SM3_STATE_UPDATE,			// 正在处理数据
++	HMAC_SM3_STATE_FINALIZED,		// 已完成计算
++};
++
++enum {
++	ALG_SM3 = 0x20200730,
++	ALG_SM4,
++	ALG_SM2_SIGN,
++	ALG_SM2_VERIFY,
++	ALG_SM2_ENC,
++	ALG_SM2_DEC,
++	ALG_SM2_KEY,
++	ALG_SM2_EXCHANGEKEY,
++	ALG_SM2_PUBKEY,
++	ALG_HMAC_SM3,
++};
++
++typedef struct _sm3_context {
++	uint32_t total[2]; /* number of bytes processed */
++	uint32_t state[8]; /* intermediate digest state */
++	uint8_t buffer[64]; /* data block being processed */
++	uint8_t ipad[64];
++	uint8_t opad[64];
++} _sm3_context;
++
++
++// phytium_sm3_context 结构为硬件存储固定结构，不要动
++typedef struct {
++	volatile int *user_count;
++	uint32_t *v_dma_buf;
++	struct _sm3_context sm3_ctx;
++} phytium_sm3_context;
++
++typedef struct {
++	phytium_sm3_context sm3_ctx;
++	uint8_t i_key_pad[SM3_BLOCK_BYTE_LEN];
++	uint8_t o_key_pad[SM3_BLOCK_BYTE_LEN];
++	int desc_id;		// 主描述符ID，标识整个HMAC-SM3计算上下文
++	int inner_desc_id;	// 内部哈希的描述符ID
++	int state;			// 状态标识：0-初始化，1-已设置密钥，2-正在处理数据
++} phytium_hmac_sm3_context;
++
++typedef struct {
++	uint32_t scto_key[4];
++	uint32_t mode;
++	uint32_t cryptomode;
++	volatile int *user_count;
++	uint32_t *v_dma_buf;
++	uint32_t total_len;
++	uint8_t oiv[16];
++	uint8_t iv[16];
++	union {
++		struct _sm4_context sm4_ctx;
++		char data[256];
++	};
++} phytium_sm4_context;
++
++typedef struct {
++	int alg;
++	union {
++		phytium_sm3_context psm3_ctx;
++		phytium_hmac_sm3_context phmac_sm3_ctx;
++		phytium_sm4_context psm4_ctx;
++	};
++	void *v_dma_buf;
++} __attribute__((aligned(512))) phytium_scto_context;
++
++typedef struct phytium_prov_ctx {
++    phytium_scto_context *scto_desc_start[(SCTO_DESC_NUM + 1) * sizeof(phytium_scto_context) / 0x400000 + 1];
++    void *dma_buf[SCTO_DESC_NUM + 1];
++	int scto_fd;
++    uint64_t *common_info_start;
++    void * regs_addr;
++    uint32_t scto_ske_bigendian;
++    uint32_t scto_hash_bigendian;
++	char name[64];
++	char version[32];
++	char buildinfo[256];
++} phytium_provctx;
++
++// extern int phytium_scto_fd;
++// extern uint64_t *phytium_common_info_start;
++// extern phytium_scto_context *phytium_desc_start[];
++
++typedef struct {
++	uint32_t counter;
++} __attribute__((aligned(64))) mepool_t;
++
++typedef struct {
++	uint32_t num;
++	uint32_t alloc_index;
++	uint32_t free_index;
++	uint32_t counter[0];
++} per_thread_mepool_t;
++
++#include <stdbool.h>
++
++#define PHY_CRYPTO_DRIVER_INFO _IOWR('p', 0x9, struct phy_crypto_kernel_info)
++
++#define PHY_CRYPTO_LIB_MAGIC (0x2025051600000000ul)
++
++// extern uint32_t phytium_scto_ske_bigendian;
++// extern uint32_t phytium_scto_hash_bigendian;
++
++#define SKE_REVERSE(provctx) ((provctx)->scto_ske_bigendian)
++#define HASH_REVERSE(provctx) ((provctx)->scto_hash_bigendian)
++
++struct phy_crypto_kernel_info {
++	uint64_t magic_number;
++	uint32_t version_number;
++	uint32_t response : 1; /* driver response it */
++	uint32_t endian : 2; /* 1-2bit, 1:hash, 2 ske, value 0: little, 1 big endian */
++	uint32_t reserved : 29;
++	char version[32];
++};
++
++
++typedef struct _SM3_SM4_CTX {
++	phytium_provctx *provctx;
++	int desc_id;
++} _SM3_SM4_CTX;
++
++//#define GET_SCTO_PROVIDER_
++#define GET_SCTO_PROVIDER_FD(provctx)  (((phytium_provctx*)provctx)->scto_fd)
++typedef _SM3_SM4_CTX SM3_CTX;
++typedef _SM3_SM4_CTX SM4_CTX;
++
++static inline uint32_t swap32(uint32_t val)
++{
++	__asm__("rev %w[dst], %w[src]" : [dst] "=r"(val) : [src] "r"(val));
++	return val;
++}
++
++#define GET_UINT32_BE(n, b, i)                          \
++	do {                                            \
++		(n) = swap32(*((uint32_t *)&(b)[(i)])); \
++	} while (0)
++
++#define PUT_UINT32_BE(n, b, i)                          \
++	do {                                            \
++		*((uint32_t *)&(b)[(i)]) = swap32((n)); \
++	} while (0)
++
++
++	#define SHL(x, n) (((x) & 0xFFFFFFFF) << (n))
++#define ROTL(x, n) (SHL((x), (n)) | ((x) >> (32 - (n))))
++
++#define SWAP(a, b)              \
++	{                       \
++		uint32_t t = a; \
++		a = b;          \
++		b = t;          \
++		t = 0;          \
++	}
++
++
++static inline void smx_reverse_word(const void *in, void *out, uint32_t wordlen)
++{
++	uint32_t i;
++	const uint32_t *input = (const uint32_t*)in;
++	uint32_t *output = (uint32_t*)out;
++
++	for (i = 0; i < wordlen; i++)
++		output[i] = swap32(input[i]);
++}
++
++static inline void smx_dma_reverse_word(const void *in, void *out,
++					uint32_t wordlen)
++{
++	uint32_t i, j, tmp;
++	const uint32_t *input = (const uint32_t*)in;
++	uint32_t *output = (uint32_t*)out;
++
++	for (i = 0; i < wordlen; i += 4) {
++		for (j = 0; j < 2; j++) {
++			tmp = input[i + j];
++			output[i + j] = swap32(input[i + 0x3 - j]);
++			output[i + 0x3 - j] = swap32(tmp);
++		}
++	}
++}
++
++
++#define GET_PHYTIUM_SCTO_CTX_PTR(provctx, desc_id)                     \
++ 	&((provctx)->scto_desc_start[(desc_id) /                           \
++				  (0x400000 / sizeof(phytium_scto_context))]      \
++				 [(desc_id) &                                        \
++				  ((0x400000 / sizeof(phytium_scto_context)) -1)])   \
++
++static inline void set_phytium_provctx_algo_with_descid(phytium_provctx *provctx, int desc_id, int alg)
++{
++	phytium_scto_context *ctx = GET_PHYTIUM_SCTO_CTX_PTR(provctx, desc_id);
++	ctx->alg = alg;
++}
++
++
++
++#endif
+Index: b/providers/phytium/phytiumprov.c
+===================================================================
+--- /dev/null
++++ b/providers/phytium/phytiumprov.c
+@@ -0,0 +1,182 @@
++#include <openssl/core_dispatch.h>
++#include <openssl/core.h>
++#include <prov/names.h>
++#include <openssl/core_names.h>
++#include <openssl/params.h>
++#include "scto.h"
++#include "sm2_phytium.h"
++
++
++
++
++OSSL_provider_init_fn ossl_scto_provider_init;
++
++# ifndef FIPS_MODULE
++static OSSL_FUNC_core_new_error_fn *c_new_error = NULL;
++static OSSL_FUNC_core_set_error_debug_fn *c_set_error_debug = NULL;
++static OSSL_FUNC_core_vset_error_fn *c_vset_error = NULL;
++
++static const OSSL_ITEM *phytium_get_reason_strings(void *_)
++{
++    static const OSSL_ITEM reason_strings[] = {
++        {501, "dummy reason string"},
++        {502, "Can't create child library context"},
++        {503, "Can't load default provider"},
++        {0, NULL}
++    };
++
++    return reason_strings;
++}
++# endif
++static const char PHYTIUM_PROPERTIES[] = "provider=scto";
++
++static const OSSL_PARAM phytium_provider_params[] = {
++    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_NAME, NULL, 0),
++    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_VERSION, NULL, 0),
++    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_BUILDINFO, NULL, 0),
++    OSSL_PARAM_int(OSSL_PROV_PARAM_STATUS, NULL),
++    OSSL_PARAM_END
++};
++
++
++extern const OSSL_DISPATCH phytium_sm3_functions[];
++extern const OSSL_DISPATCH phytium_sm4ecb_functions[];
++extern const OSSL_DISPATCH phytium_sm4cbc_functions[];
++extern const OSSL_DISPATCH phytium_sm4ctr_functions[];
++
++static const OSSL_ALGORITHM phytium_digests[] = {
++    {PROV_NAMES_SM3, PHYTIUM_PROPERTIES, phytium_sm3_functions},
++    {NULL, NULL, NULL},
++};
++
++static const OSSL_ALGORITHM phytium_ciphers[] = {
++    {PROV_NAMES_SM4_CBC, PHYTIUM_PROPERTIES, phytium_sm4cbc_functions},
++    {PROV_NAMES_SM4_ECB, PHYTIUM_PROPERTIES, phytium_sm4ecb_functions},
++    {PROV_NAMES_SM4_CTR, PHYTIUM_PROPERTIES, phytium_sm4ctr_functions},
++    {NULL, NULL, NULL},
++};
++
++// static const OSSL_ALGORITHM phytium_signature[] = {
++//     {PROV_NAMES_SM2, PHYTIUM_PROPERTIES, phytium_sm2sign_functions},
++//     {NULL, NULL, NULL},
++// };
++
++static const OSSL_PARAM *phytium_provider_gettable_params(void *provctx)
++{
++    return phytium_provider_params;
++}
++
++static const int phytium_provider_get_params(void *provctx, OSSL_PARAM params[])
++{
++    phytium_provctx *ctx = (phytium_provctx*)provctx;
++    OSSL_PARAM *p;
++    if (ctx == NULL) return 0;
++
++    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_NAME);
++    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, ctx->name))
++        return 0;
++
++    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_VERSION);
++    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, ctx->version))
++        return 0;
++
++    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_BUILDINFO);
++    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, ctx->buildinfo))
++        return 0;
++
++    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_STATUS);
++    if (p != NULL && !OSSL_PARAM_set_int(p, ossl_prov_is_running()))
++        return 0;
++
++    return 1;
++}
++
++static const OSSL_ALGORITHM * phytium_provider_query(void *provctx, int operation_id, int *no_cache)
++{
++    *no_cache = 0;  // 是否缓存结果
++
++    switch (operation_id) {
++    case OSSL_OP_DIGEST:    // 摘要算法
++        return phytium_digests;
++    case OSSL_OP_CIPHER:    // 加密算法
++        return phytium_ciphers;
++    // case OSSL_OP_KEYMGMT:   // 密钥管理
++    //     return my_keymgmt;
++    // case OSSL_OP_SIGNATURE: // 签名算法
++    //     return phytium_signature;
++    default:
++        return NULL;
++    }
++}
++
++static void phytium_provider_teardown(void *provctx)
++{
++    phytium_scto_lib_scto_exit((phytium_provctx*)provctx);
++}
++
++static const OSSL_DISPATCH phytium_provider_dispatch_table[] = {
++# ifndef FIPS_MODULE
++    { OSSL_FUNC_PROVIDER_GET_REASON_STRINGS,
++        (void (*)(void))phytium_get_reason_strings},
++# endif
++    { OSSL_FUNC_PROVIDER_GET_PARAMS, (void (*)(void))phytium_provider_get_params },
++    { OSSL_FUNC_PROVIDER_GETTABLE_PARAMS, (void (*)(void))phytium_provider_gettable_params },
++    { OSSL_FUNC_PROVIDER_TEARDOWN, (void (*)(void))phytium_provider_teardown },
++    { OSSL_FUNC_PROVIDER_QUERY_OPERATION, (void (*)(void))phytium_provider_query },
++    OSSL_DISPATCH_END
++};
++
++/* Provider 初始化函数 */
++int ossl_scto_provider_init(const OSSL_CORE_HANDLE *handle,
++                        const OSSL_DISPATCH *in,
++                        const OSSL_DISPATCH **out,
++                        void **provctx) {
++# ifndef FIPS_MODULE
++    for (; in->function_id != 0; in++) {
++        switch (in->function_id) {
++            case OSSL_FUNC_CORE_NEW_ERROR:
++                c_new_error = OSSL_FUNC_core_new_error(in);
++                break;
++            case OSSL_FUNC_CORE_SET_ERROR_DEBUG:
++                c_set_error_debug = OSSL_FUNC_core_set_error_debug(in);
++                break;
++            case OSSL_FUNC_CORE_VSET_ERROR:
++                c_vset_error = OSSL_FUNC_core_vset_error(in);
++                break;
++        }
++    }
++# endif
++    *out = phytium_provider_dispatch_table;
++    phytium_provctx *ctx = OPENSSL_zalloc(sizeof(phytium_provctx));
++    ctx->scto_fd = -1;
++    ctx->regs_addr = NULL;
++    ctx->scto_hash_bigendian = 1;
++    ctx->scto_ske_bigendian = 1;
++    for (int i = 0; i < (sizeof(ctx->scto_desc_start) / sizeof(phytium_scto_context*)) ; i++ ) {
++        ctx->scto_desc_start[i] = NULL;
++    }
++
++    for (int i = 0; i < SCTO_DESC_NUM + 1; i++) {
++        ctx->dma_buf[i] = NULL;
++    }
++
++    memset(ctx->name, 0, sizeof(ctx->name));
++    strncpy(ctx->name, "Phytium SCTO Provider", sizeof(ctx->name) - 1);
++    memset(ctx->version, 0, sizeof(ctx->version));
++    strncpy(ctx->version, "1.8.3", sizeof(ctx->version) - 1);
++
++    // 构建信息（可以包含编译时信息）
++    memset(ctx->buildinfo, 0, sizeof(ctx->buildinfo));
++    snprintf(ctx->buildinfo, sizeof(ctx->buildinfo),
++             "Phytium SCTO Provider %s built on %s at %s",
++             ctx->version, __DATE__, __TIME__);
++
++    int ret = phytium_scto_lib_scto_init(ctx);
++    if (ret < 0) {
++        OPENSSL_free(ctx);
++        return 0;
++    }
++    *provctx = (void *)ctx;
++    return 1;
++}
++
+Index: b/providers/phytium/sm2_phytium.c
+===================================================================
+--- /dev/null
++++ b/providers/phytium/sm2_phytium.c
+@@ -0,0 +1,662 @@
++#include "smx_common.h"
++#include "sm2_phytium.h"
++
++int phytium_scto_sm2_exchangekey(uint8_t role, uint8_t *a_prikey,
++				 uint8_t *b_pubkey, uint8_t *a_tmp_prikey,
++				 uint8_t *a_tmp_pubkey, uint8_t *b_tmp_pubkey,
++				 uint8_t *ZA, uint8_t *ZB, uint32_t key_length,
++				 uint8_t *key_data, uint8_t *S1, uint8_t *SA)
++{
++	int ret;
++	struct sm2_info info = { 0 };
++	uint8_t src[512] = { 0 };
++	uint8_t *result;
++
++	if (a_prikey == NULL || b_pubkey == NULL || a_tmp_prikey == NULL ||
++	    a_tmp_pubkey == NULL || b_tmp_pubkey == NULL || ZA == NULL ||
++	    ZB == NULL || key_data == NULL) {
++		SCTO_LOG_ERR("Invalid null param\r\n");
++		return -1;
++	}
++
++	if (key_length == 0) {
++		SCTO_LOG_ERR("Invalid key len 0\r\n");
++		return -1;
++	}
++
++	result = malloc(key_length + 64);
++	if (result == NULL) {
++		SCTO_LOG_ERR("Alloc key space error\r\n");
++		return -1;
++	}
++
++	memset(result, 0, key_length + 64);
++	if (role)
++		src[0] = 1;
++	else
++		src[0] = 0;
++
++	memcpy(src + 1, a_prikey, 32);
++	memcpy(src + 1 + 96, a_tmp_prikey, 32);
++	memcpy(src + 1 + 128, a_tmp_pubkey, 64);
++	memcpy(src + 1 + 192, b_pubkey, 64);
++	memcpy(src + 1 + 256, b_tmp_pubkey, 64);
++	memcpy(src + 1 + 320, ZA, 32);
++	memcpy(src + 1 + 352, ZB, 32);
++
++	info.type = ALG_SM2_EXCHANGEKEY;
++	info.src = src;
++	info.src_len = 512;
++	info.dst = result;
++	info.dst_len = key_length + 64;
++
++	ret = ioctl(phytium_scto_fd, SCTO_SM2, (unsigned long)&info);
++	if (ret) {
++		SCTO_LOG_ERR("sm2 exchange key failed!\n");
++	} else {
++		memcpy(key_data, result, key_length);
++		if (S1)
++			memcpy(S1, result + key_length, 32);
++
++		if (SA)
++			memcpy(SA, result + key_length + 32, 32);
++	}
++
++	free(result);
++
++	/* copy from result */
++
++	return ret;
++}
++
++int phytium_scto_sm2_enc(uint8_t *src, const uint32_t src_len, uint8_t *pub_key,
++			 const uint32_t pub_key_len, uint8_t *dst,
++			 uint32_t *dst_len)
++{
++	struct sm2_info info;
++	int ret;
++
++	if (src == NULL || dst == NULL || pub_key == NULL || dst_len == NULL)
++		return -1;
++	if (src_len == 0 || pub_key_len == 0)
++		return -1;
++
++	info.type = ALG_SM2_ENC;
++	info.src = src;
++	info.src_len = src_len;
++	info.dst = dst;
++	info.dst_len = *dst_len;
++	info.key = pub_key;
++
++	ret = ioctl(phytium_scto_fd, SCTO_SM2, (unsigned long)&info);
++	if (ret) {
++		SCTO_LOG_ERR("sm2 encrypt failed!\n");
++	}
++	*dst_len = info.dst_len;
++
++	return 0;
++}
++int phytium_scto_sm2_dec(uint8_t *src, const uint32_t src_len,
++			 uint8_t *priv_key, const uint32_t priv_key_len,
++			 uint8_t *dst, uint32_t *dst_len)
++{
++	struct sm2_info info;
++	int ret;
++
++	if (src == NULL || dst == NULL || priv_key == NULL || dst_len == NULL)
++		return -1;
++	if (src_len == 0 || priv_key_len == 0)
++		return -1;
++
++	info.type = ALG_SM2_DEC;
++	info.src = src;
++	info.src_len = src_len;
++	info.dst = dst;
++	info.dst_len = *dst_len;
++	info.key = priv_key;
++
++	ret = ioctl(phytium_scto_fd, SCTO_SM2, (unsigned long)&info);
++	if (ret) {
++		SCTO_LOG_ERR("sm2 decrypt failed!\n");
++	}
++	*dst_len = info.dst_len;
++	return ret;
++}
++int phytium_scto_sm2_sign(uint8_t *e, const uint32_t e_len, uint8_t *priv_key,
++			  const uint32_t priv_key_len, uint8_t *der_code_out,
++			  uint32_t *der_code_out_len)
++{
++	struct sm2_info info;
++	int ret;
++
++	if (e == NULL || der_code_out == NULL || priv_key == NULL ||
++	    der_code_out_len == NULL)
++		return -1;
++	if (e_len == 0 || priv_key_len == 0)
++		return -1;
++
++	info.type = ALG_SM2_SIGN;
++	info.src = e;
++	info.src_len = e_len;
++	info.dst = der_code_out;
++	info.dst_len = 256;
++	info.key = priv_key;
++
++	ret = ioctl(phytium_scto_fd, SCTO_SM2, (unsigned long)&info);
++	if (ret) {
++		SCTO_LOG_ERR("sm2 sign failed!\n");
++	}
++	*der_code_out_len = info.dst_len;
++	return ret;
++}
++
++int phytium_scto_sm2_verify(uint8_t *e, const uint32_t e_len, uint8_t *pub_key,
++			    const uint32_t pub_key_len, uint8_t *sign_result,
++			    uint32_t sign_result_len)
++{
++	struct sm2_info info;
++	int ret;
++	uint8_t *tmp = NULL;
++
++	if (e == NULL || sign_result == NULL || pub_key == NULL)
++		return -1;
++	if (e_len == 0 || pub_key_len == 0)
++		return -1;
++
++	tmp = malloc(sign_result_len + e_len);
++	if (tmp == NULL) {
++		SCTO_LOG_ERR("Alloc mem error");
++		return -1;
++	}
++
++	memcpy(tmp, sign_result, sign_result_len);
++	memcpy(tmp + sign_result_len, e, e_len);
++
++	info.type = ALG_SM2_VERIFY;
++	info.src = tmp;
++	info.src_len = sign_result_len + e_len;
++	info.dst = NULL;
++	info.dst_len = 0;
++	info.key = pub_key;
++
++	ret = ioctl(phytium_scto_fd, SCTO_SM2, (unsigned long)&info);
++	if (ret) {
++		SCTO_LOG_ERR("sm2 verify failed!\n");
++	}
++	free(tmp);
++
++	return ret;
++}
++
++int phytium_scto_sm2_pubkey(const uint8_t prikey[32], uint8_t pubkey[65])
++{
++	int ret = -1;
++	uint8_t key[128] = { 0 };
++	struct sm2_info info;
++
++	if (prikey == NULL || pubkey == NULL)
++		return -1;
++
++	info.type = ALG_SM2_PUBKEY;
++	info.key = key;
++	memcpy(key, prikey, 32);
++
++	ret = ioctl(phytium_scto_fd, SCTO_SM2, (unsigned long)&info);
++	if (ret) {
++		SCTO_LOG_ERR("sm2 pub key failed!\n");
++	} else {
++		memcpy(pubkey, key + 32, 65);
++	}
++
++	return ret;
++}
++
++int phytium_scto_sm2_genkey(uint8_t prikey[32], uint8_t pubkey[65])
++{
++	struct sm2_info info;
++	int ret;
++	uint8_t key[128] = { 0 };
++
++	if (prikey == NULL || pubkey == NULL)
++		return -1;
++
++	info.type = ALG_SM2_KEY;
++	info.key = key;
++
++	ret = ioctl(phytium_scto_fd, SCTO_SM2, (unsigned long)&info);
++	if (ret) {
++		SCTO_LOG_ERR("sm2 key failed!\n");
++	} else {
++		memcpy(prikey, key, 32);
++		memcpy(pubkey, key + 32, 65);
++	}
++
++	return ret;
++}
++
++void scto_sm2signature_encode(uint8_t *input, uint8_t *sig, uint32_t *sig_len)
++{
++	uint32_t offset;
++	uint32_t rlen, slen;
++	uint8_t r[32], s[32];
++
++	for (offset = 0; offset < 31; offset++) {
++		if (input[offset])
++			break;
++	}
++
++	rlen = 32 - offset;
++	memcpy(r, input + 32 - rlen, rlen);
++
++	for (offset = 32; offset < 63; offset++) {
++		if (input[offset])
++			break;
++	}
++
++	slen = 64 - offset;
++	memcpy(s, input + 64 - slen, slen);
++
++	*sig_len = 6 + rlen + slen;
++	sig[0] = 0x30; //Tag 0, ASN1_SEQ(bit 0-4), Value = TLV + TLV + ...(bit5)
++	sig[1] = 4 + rlen + slen; //Len 0,
++	sig[2] = 0x02; //Tag 1, ASN1_INT(bit 0-4)
++	sig[3] = rlen; //Len 1,
++
++	offset = 4;
++	if (r[0] & 0x80) { //Highest bit, r is unsigned Integer
++		*sig_len += 1;
++		sig[1]++;
++		sig[3]++;
++		sig[4] = 0x00;
++		offset++;
++	}
++
++	memcpy(sig + offset, r, rlen);
++	offset += rlen;
++
++	sig[offset++] = 0x02; //Tag 2, ASN1_INT(bit 0-4)
++	sig[offset++] = slen; //Len 2,
++
++	if (s[0] & 0x80) { //Highest bit, s is unsigned Integer
++		*sig_len += 1;
++		sig[1]++;
++		sig[offset - 1]++;
++		sig[offset++] = 0x00;
++	}
++
++	memcpy(sig + offset, s, slen);
++}
++
++int scto_sm2signature_decode(uint8_t *sig, uint32_t sig_len, uint8_t *out)
++{
++	uint32_t offset = 4, len;
++	uint32_t rlen, slen;
++	uint8_t r[32] = { 0 }, s[32] = { 0 };
++
++	if (unlikely((sig[0] != 0x30) ||
++		     (sig[2] != 0x02))) { //check Tag 0 and Tag 1
++		SCTO_LOG_ERR(
++			"%s:((sig[0] != 0x30) || (sig[2] != 0x02)), err!\n",
++			__func__);
++		return -1;
++	}
++
++	len = sig[1] + 2;
++	if (unlikely(len != sig_len)) { //check Len 0
++		SCTO_LOG_ERR("%s:len != sig_len, err!\n", __func__);
++		return -1;
++	}
++
++	rlen = sig[3]; //check Len 1
++	if (rlen == 0x21) {
++		offset++;
++		rlen = 0x20;
++	} else if (rlen > 0x21) {
++		SCTO_LOG_ERR("%s:rlen > 0x21, err!\n", __func__);
++		return -1;
++	}
++
++	memcpy(r + 32 - rlen, sig + offset, rlen);
++	offset += rlen;
++
++	if (unlikely(sig[offset++] != 0x02)) { //check Tag 2
++		SCTO_LOG_ERR("%s:Tag 2 != 0x02, err!\n", __func__);
++		return -1;
++	}
++
++	slen = sig[offset]; //check Len 2
++	if (slen == 0x21) {
++		offset++;
++		slen = 0x20;
++	} else if (slen > 0x21) {
++		SCTO_LOG_ERR("%s:slen > 0x21, err!\n", __func__);
++		return -1;
++	}
++	offset++;
++
++	if (offset + slen == sig_len) //check Value Length
++		memcpy(s + 32 - slen, sig + offset, slen);
++	else {
++		SCTO_LOG_ERR("%s:offset + slen != sig_len, err!\n", __func__);
++		return -1;
++	}
++
++	memcpy(out, r, 32);
++	memcpy(out + 32, s, 32);
++
++	return 0;
++}
++
++void scto_sm2encrypt_encode(uint8_t *input, uint32_t inlen, uint8_t *output,
++			    uint32_t *outlen)
++{
++	uint8_t *c2;
++	uint8_t x[32], y[32], hash[32];
++	uint8_t xhead[4], yhead[4], hashhead[4], c2head[8], head[8];
++	uint32_t offset, length, c2headlen, xheadlen, yheadlen, hashheadlen,
++		headlen, c2len, i;
++	uint32_t xlen, ylen;
++
++	c2 = input + 97;
++	memcpy(x, input + 1, 32);
++	memcpy(y, input + 33, 32);
++	memcpy(hash, input + 65, 32);
++
++	c2len = inlen - 97;
++	c2headlen = 2;
++	if (c2len > 127)
++		c2headlen = 3;
++	if (c2len > 255)
++		c2headlen = 4;
++	if (c2len > 65535)
++		c2headlen = 5;
++	if (c2len > 16777215)
++		c2headlen = 6;
++
++	c2head[0] = 0x04; // Tag, ASN1_OTS
++	switch (c2headlen) {
++	case 2:
++		c2head[1] = c2len; //Len(bit7 = 0)
++		break;
++	case 3:
++		c2head[1] = 0x81; //Len(bit7 = 1, bit0-6 = Len length)
++		c2head[2] = c2len;
++		break;
++	case 4:
++		c2head[1] = 0x82;
++		c2head[2] = c2len >> 8;
++		c2head[3] = c2len;
++		break;
++	case 5:
++		c2head[1] = 0x83;
++		c2head[2] = c2len >> 16;
++		c2head[3] = c2len >> 8;
++		c2head[4] = c2len;
++		break;
++	case 6:
++		c2head[1] = 0x84;
++		c2head[2] = c2len >> 24;
++		c2head[3] = c2len >> 16;
++		c2head[4] = c2len >> 8;
++		c2head[5] = c2len;
++		break;
++	default:
++		break;
++	}
++
++	for (i = 0; i < 31; i++) {
++		if (x[i])
++			break;
++	}
++	xlen = 32 - i;
++	xheadlen = 2;
++	if (x[i] & 0x80) //Highest bit, x is unsigned Integer
++		xheadlen = 3;
++	xhead[0] = 0x2; //Tag, ASN1_INT
++	switch (xheadlen) {
++	case 2:
++		xhead[1] = xlen;
++		break;
++	case 3:
++		xhead[1] = xlen + 1;
++		xhead[2] = 0x00;
++		break;
++	default:
++		break;
++	}
++
++	for (i = 0; i < 31; i++) {
++		if (y[i])
++			break;
++	}
++	ylen = 32 - i;
++	yheadlen = 2;
++	if (y[i] & 0x80) //Highest bit, y is unsigned Integer
++		yheadlen = 3;
++	yhead[0] = 0x2; //Tag, ASN1_INT
++	switch (yheadlen) {
++	case 2:
++		yhead[1] = ylen;
++		break;
++	case 3:
++		yhead[1] = ylen + 1;
++		yhead[2] = 0x00;
++		break;
++	default:
++		break;
++	}
++
++	hashheadlen = 2;
++	hashhead[0] = 0x04; // Tag, ASN1_OTS
++	hashhead[1] = 0x20;
++
++	length = c2headlen + c2len;
++	length += xheadlen + xlen;
++	length += yheadlen + ylen;
++	length += hashheadlen + 32;
++
++	headlen = 2;
++	if (length > 127)
++		headlen = 3;
++	if (length > 255)
++		headlen = 4;
++	if (length > 65535)
++		headlen = 5;
++	if (length > 16777215)
++		headlen = 6;
++
++	head[0] = 0x30; //Tag, ASN1_SEQ, Value = TLV + TLV + ...
++	switch (headlen) {
++	case 2:
++		head[1] = length;
++		break;
++	case 3:
++		head[1] = 0x81;
++		head[2] = length;
++		break;
++	case 4:
++		head[1] = 0x82;
++		head[2] = length >> 8;
++		head[3] = length;
++		break;
++	case 5:
++		head[1] = 0x83;
++		head[2] = length >> 16;
++		head[3] = length >> 8;
++		head[4] = length;
++		break;
++	case 6:
++		head[1] = 0x84;
++		head[2] = length >> 24;
++		head[3] = length >> 16;
++		head[4] = length >> 8;
++		head[5] = length;
++		break;
++	default:
++		break;
++	}
++
++	offset = 0;
++	memcpy(output + offset, head, headlen);
++	offset += headlen;
++	memcpy(output + offset, xhead, xheadlen);
++	offset += xheadlen;
++	memcpy(output + offset, x + 32 - xlen, xlen);
++	offset += xlen;
++	memcpy(output + offset, yhead, yheadlen);
++	offset += yheadlen;
++	memcpy(output + offset, y + 32 - ylen, ylen);
++	offset += ylen;
++	memcpy(output + offset, hashhead, hashheadlen);
++	offset += hashheadlen;
++	memcpy(output + offset, hash, 32);
++	offset += 32;
++	memcpy(output + offset, c2head, c2headlen);
++	offset += c2headlen;
++	memmove(output + offset, c2, c2len);
++	offset += c2len;
++
++	*outlen = offset;
++}
++
++int scto_sm2decrypt_decode(uint8_t *input, uint32_t inlen, uint8_t *output,
++			   uint32_t *outlen)
++{
++	uint8_t x[32] = { 0 }, y[32] = { 0 }, hash[32];
++	uint32_t offset, length, c2headlen, xheadlen, yheadlen, hashheadlen,
++		headlen, c2len, i;
++	uint32_t xlen, ylen;
++
++	if (unlikely(inlen < 45)) { //head:10 hash:32 x:1 y:1 c2:1
++		SCTO_LOG_ERR("%s:inlen[%u], err!\n", __func__, inlen);
++		return -1;
++	}
++
++	if (unlikely(input[0] != 0x30)) { //check Tag
++		SCTO_LOG_ERR("%s:input[0] != 0x30, err!\n", __func__);
++		return -1;
++	}
++	if (input[1] & 0x80) {
++		headlen = 2 + (input[1] & 0x7f);
++		if (unlikely(headlen > 6)) {
++			SCTO_LOG_ERR("%s:headlen > 6, err!\n", __func__);
++			return -1;
++		}
++
++		length = 0;
++		for (i = 2; i < headlen; i++) {
++			length <<= 8;
++			length += input[i];
++		}
++	} else {
++		headlen = 2;
++		length = input[1];
++	}
++
++	if (unlikely(headlen + length != inlen)) {
++		SCTO_LOG_ERR("%s: %u (headlen + length != inlen %u ), err!\n",
++			     __func__, headlen + length, inlen);
++		return -1;
++	}
++
++	offset = headlen;
++	if (unlikely(input[offset] != 0x02)) {
++		SCTO_LOG_ERR("%s:(input[offset] != 0x02), err!\n", __func__);
++		return -1;
++	}
++
++	xlen = input[offset + 1];
++	xheadlen = 2;
++	if (xlen == 0x21) {
++		xheadlen = 3;
++		xlen = 0x20;
++	} else if (xlen > 0x21) {
++		SCTO_LOG_ERR("%s:(xlen > 0x21), err!\n", __func__);
++		return -1;
++	}
++
++	offset += xheadlen;
++	memcpy(x + 32 - xlen, input + offset, xlen);
++	offset += xlen;
++
++	if (unlikely(input[offset] != 0x02)) {
++		SCTO_LOG_ERR("%s:(input[offset] != 0x02), err!\n", __func__);
++		return -1;
++	}
++	ylen = input[offset + 1];
++	yheadlen = 2;
++	if (ylen == 0x21) {
++		yheadlen = 3;
++		ylen = 0x20;
++	}
++
++	if (unlikely(offset + yheadlen + ylen + 2 > inlen)) {
++		SCTO_LOG_ERR(
++			"%s:(offset + yheadlen + ylen + 2 > inlen), err!\n",
++			__func__);
++		return -1;
++	}
++
++	offset += yheadlen;
++	memcpy(y + 32 - ylen, input + offset, ylen);
++	offset += ylen;
++
++	if (unlikely((input[offset] != 0x04) || (input[offset + 1] != 0x20))) {
++		SCTO_LOG_ERR(
++			"%s:((input[offset] != 0x04) || (input[offset + 1] != 0x20)), err!\n",
++			__func__);
++		return -1;
++	}
++	hashheadlen = 2;
++	offset += hashheadlen;
++
++	if (unlikely(offset + 35 > inlen)) {
++		SCTO_LOG_ERR("%s:(offset + 35 > inlen), err!\n", __func__);
++		return -1;
++	}
++
++	memcpy(hash, input + offset, 32);
++	offset += 32;
++
++	if (unlikely(input[offset] != 0x04)) {
++		SCTO_LOG_ERR("%s:(input[offset] != 0x04), err!\n", __func__);
++		return -1;
++	}
++	if (input[offset + 1] & 0x80) {
++		c2headlen = 2 + (input[offset + 1] & 0x7f);
++		if (unlikely(c2headlen > 6)) {
++			SCTO_LOG_ERR("%s:(c2headlen > 6), err!\n", __func__);
++			return -1;
++		}
++
++		if (unlikely(offset + c2headlen > inlen)) {
++			SCTO_LOG_ERR("%s:(offset + c2headlen > inlen), err!\n",
++				     __func__);
++			return -1;
++		}
++
++		c2len = 0;
++		for (i = 2; i < c2headlen; i++) {
++			c2len <<= 8;
++			c2len += input[offset + i];
++		}
++	} else {
++		c2headlen = 2;
++		c2len = input[offset + 1];
++	}
++
++	offset += c2headlen;
++	if (unlikely(offset + c2len != inlen)) {
++		SCTO_LOG_ERR("%s:(offset + c2len != inlen), err!\n", __func__);
++		return -1;
++	}
++
++	output[0] = 0x04;
++	memcpy(output + 1, x, 32);
++	memcpy(output + 33, y, 32);
++	memcpy(output + 65, hash, 32);
++	memmove(output + 97, input + offset, c2len);
++	*outlen = c2len + 97;
++
++	return 0;
++}
+\ No newline at end of file
+Index: b/providers/phytium/sm2_phytium.h
+===================================================================
+--- /dev/null
++++ b/providers/phytium/sm2_phytium.h
+@@ -0,0 +1,53 @@
++#ifndef _SM2_PHYTIUM_H__
++#define _SM2_PHYTIUM_H__
++
++#include <stddef.h>
++#include <stdint.h>
++#include <openssl/types.h>
++#include <openssl/core.h>
++
++struct sm2_info {
++	uint32_t type;
++	uint32_t src_len;
++	uint32_t dst_len;
++	uint8_t *src;
++	uint8_t *dst;
++	uint8_t *key;
++};
++
++extern const OSSL_DISPATCH phytium_sm2sign_functions[];
++
++/*API*/
++int phytium_scto_sm2_sign(uint8_t *e, const uint32_t e_len, uint8_t *priv_key,
++			  const uint32_t priv_key_len, uint8_t *der_code_out,
++			  uint32_t *der_code_out_len);
++int phytium_scto_sm2_verify(uint8_t *e, const uint32_t e_len, uint8_t *pub_key,
++			    const uint32_t pub_key_len, uint8_t *sign_result,
++			    uint32_t sign_result_len);
++int phytium_scto_sm2_dec(uint8_t *src, const uint32_t src_len,
++			 uint8_t *priv_key, const uint32_t priv_key_len,
++			 uint8_t *dst, uint32_t *dst_len);
++int phytium_scto_sm2_enc(uint8_t *src, const uint32_t src_len, uint8_t *pub_key,
++			 const uint32_t pub_key_len, uint8_t *dst,
++			 uint32_t *dst_len);
++
++int phytium_scto_sm2_genkey(uint8_t prikey[32], uint8_t pubkey[65]);
++
++int phytium_scto_sm2_pubkey(const uint8_t prikey[32], uint8_t pubkey[65]);
++
++int phytium_scto_sm2_exchangekey(uint8_t role, uint8_t *a_prikey,
++				 uint8_t *b_pubkey, uint8_t *a_tmp_prikey,
++				 uint8_t *a_tmp_pubkey, uint8_t *b_tmp_pubkey,
++				 uint8_t *ZA, uint8_t *ZB, uint32_t key_length,
++				 uint8_t *key_data, uint8_t *S1, uint8_t *SA);
++
++void scto_sm2signature_encode(uint8_t *input, uint8_t *sig, uint32_t *sig_len);
++
++int scto_sm2signature_decode(uint8_t *sig, uint32_t sig_len, uint8_t *out);
++
++void scto_sm2encrypt_encode(uint8_t *input, uint32_t inlen, uint8_t *output,
++			    uint32_t *outlen);
++
++int scto_sm2decrypt_decode(uint8_t *input, uint32_t inlen, uint8_t *output,
++			   uint32_t *outlen);
++#endif
+\ No newline at end of file
+Index: b/providers/phytium/sm3_phytium.c
+===================================================================
+--- /dev/null
++++ b/providers/phytium/sm3_phytium.c
+@@ -0,0 +1,634 @@
++
++#include "smx_common.h"
++#include "scto.h"
++#include <openssl/core_dispatch.h>
++
++
++
++void _software_sm3_init(struct _sm3_context *ctx)
++{
++	ctx->total[0] = 0;
++	ctx->total[1] = 0;
++
++	ctx->state[0] = 0x7380166F;
++	ctx->state[1] = 0x4914B2B9;
++	ctx->state[2] = 0x172442D7;
++	ctx->state[3] = 0xDA8A0600;
++	ctx->state[4] = 0xA96F30BC;
++	ctx->state[5] = 0x163138AA;
++	ctx->state[6] = 0xE38DEE4D;
++	ctx->state[7] = 0xB0FB0E4E;
++	memset(ctx->buffer, 0, 64);
++}
++
++void _process_software_sm3(struct _sm3_context *ctx, const uint8_t data[64])
++{
++	uint32_t SS1, SS2, TT1, TT2, W[68], W1[64];
++	uint32_t A, B, C, D, E, F, G, H;
++	uint32_t T[64];
++	uint32_t Temp1, Temp2, Temp3, Temp4, Temp5;
++	int j;
++
++	for (j = 0; j < 16; j++)
++		T[j] = 0x79CC4519;
++	for (j = 16; j < 64; j++)
++		T[j] = 0x7A879D8A;
++
++	GET_UINT32_BE(W[0], data, 0);
++	GET_UINT32_BE(W[1], data, 4);
++	GET_UINT32_BE(W[2], data, 8);
++	GET_UINT32_BE(W[3], data, 12);
++	GET_UINT32_BE(W[4], data, 16);
++	GET_UINT32_BE(W[5], data, 20);
++	GET_UINT32_BE(W[6], data, 24);
++	GET_UINT32_BE(W[7], data, 28);
++	GET_UINT32_BE(W[8], data, 32);
++	GET_UINT32_BE(W[9], data, 36);
++	GET_UINT32_BE(W[10], data, 40);
++	GET_UINT32_BE(W[11], data, 44);
++	GET_UINT32_BE(W[12], data, 48);
++	GET_UINT32_BE(W[13], data, 52);
++	GET_UINT32_BE(W[14], data, 56);
++	GET_UINT32_BE(W[15], data, 60);
++
++#define FF0(x, y, z) ((x) ^ (y) ^ (z))
++#define FF1(x, y, z) (((x) & (y)) | ((x) & (z)) | ((y) & (z)))
++
++#define GG0(x, y, z) ((x) ^ (y) ^ (z))
++#define GG1(x, y, z) (((x) & (y)) | ((~(x)) & (z)))
++
++#define SHL(x, n) ((x) << (n))
++#define ROTL(x, n) \
++	(SHL((x), (n) & 0x1F) | ((x) >> ((32 - ((n) & 0x1F)) & 0x1F)))
++
++#define P0(x) ((x) ^ ROTL((x), 9) ^ ROTL((x), 17))
++#define P1(x) ((x) ^ ROTL((x), 15) ^ ROTL((x), 23))
++
++	for (j = 16; j < 68; j++) {
++		/**
++		 * W[j] = P1( W[j-16] ^ W[j-9] ^ ROTL(W[j-3],15)) ^
++		 *        ROTL(W[j - 13],7 ) ^ W[j-6];
++		 */
++
++		Temp1 = W[j - 16] ^ W[j - 9];
++		Temp2 = ROTL(W[j - 3], 15);
++		Temp3 = Temp1 ^ Temp2;
++		Temp4 = P1(Temp3);
++		Temp5 = ROTL(W[j - 13], 7) ^ W[j - 6];
++		W[j] = Temp4 ^ Temp5;
++	}
++
++	for (j = 0; j < 64; j++)
++		W1[j] = W[j] ^ W[j + 4];
++
++	A = ctx->state[0];
++	B = ctx->state[1];
++	C = ctx->state[2];
++	D = ctx->state[3];
++	E = ctx->state[4];
++	F = ctx->state[5];
++	G = ctx->state[6];
++	H = ctx->state[7];
++
++	for (j = 0; j < 16; j++) {
++		SS1 = ROTL(ROTL(A, 12) + E + ROTL(T[j], j), 7);
++		SS2 = SS1 ^ ROTL(A, 12);
++		TT1 = FF0(A, B, C) + D + SS2 + W1[j];
++		TT2 = GG0(E, F, G) + H + SS1 + W[j];
++		D = C;
++		C = ROTL(B, 9);
++		B = A;
++		A = TT1;
++		H = G;
++		G = ROTL(F, 19);
++		F = E;
++		E = P0(TT2);
++	}
++
++	for (j = 16; j < 64; j++) {
++		SS1 = ROTL(ROTL(A, 12) + E + ROTL(T[j], j), 7);
++		SS2 = SS1 ^ ROTL(A, 12);
++		TT1 = FF1(A, B, C) + D + SS2 + W1[j];
++		TT2 = GG1(E, F, G) + H + SS1 + W[j];
++		D = C;
++		C = ROTL(B, 9);
++		B = A;
++		A = TT1;
++		H = G;
++		G = ROTL(F, 19);
++		F = E;
++		E = P0(TT2);
++	}
++
++	ctx->state[0] ^= A;
++	ctx->state[1] ^= B;
++	ctx->state[2] ^= C;
++	ctx->state[3] ^= D;
++	ctx->state[4] ^= E;
++	ctx->state[5] ^= F;
++	ctx->state[6] ^= G;
++	ctx->state[7] ^= H;
++}
++
++void _software_sm3_update(struct _sm3_context *ctx, const uint8_t *input,
++			  size_t ilen)
++{
++	size_t fill;
++	size_t left;
++
++	if (!ilen)
++		return;
++
++	left = ctx->total[0] & 0x3F;
++	fill = 64 - left;
++
++	ctx->total[0] += ilen;
++
++	if (unlikely(ctx->total[0] < ilen))
++		ctx->total[1]++;
++
++	if (unlikely(left && ilen >= fill)) {
++		memcpy(ctx->buffer + left, input, fill);
++		_process_software_sm3(ctx, ctx->buffer);
++		input += fill;
++		ilen -= fill;
++		left = 0;
++	}
++
++	while (ilen >= 64) {
++		_process_software_sm3(ctx, input);
++		input += 64;
++		ilen -= 64;
++	}
++
++	if (ilen > 0)
++		memcpy(ctx->buffer + left, input, ilen);
++}
++
++static const uint8_t sm3_padding0[64] = {
++	0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++	0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
++};
++
++void _software_sm3_final(struct _sm3_context *ctx, uint8_t output[32])
++{
++	uint32_t last, padn;
++	uint32_t high, low;
++	uint8_t msglen[8];
++
++	high = (ctx->total[0] >> 29) | (ctx->total[1] << 3);
++	low = ctx->total[0] << 3;
++
++	PUT_UINT32_BE(high, msglen, 0);
++	PUT_UINT32_BE(low, msglen, 4);
++
++	last = ctx->total[0] & 0x3F;
++	padn = (last < 56) ? (56 - last) : (120 - last);
++
++	_software_sm3_update(ctx, sm3_padding0, padn);
++	_software_sm3_update(ctx, msglen, 8);
++
++	PUT_UINT32_BE(ctx->state[0], output, 0);
++	PUT_UINT32_BE(ctx->state[1], output, 4);
++	PUT_UINT32_BE(ctx->state[2], output, 8);
++	PUT_UINT32_BE(ctx->state[3], output, 12);
++	PUT_UINT32_BE(ctx->state[4], output, 16);
++	PUT_UINT32_BE(ctx->state[5], output, 20);
++	PUT_UINT32_BE(ctx->state[6], output, 24);
++	PUT_UINT32_BE(ctx->state[7], output, 28);
++}
++
++
++static inline void reverse_sm3_word(const uint32_t *in,
++				    struct _sm3_context *sm3_ctx)
++{
++	sm3_ctx->state[0] = in[3];
++	sm3_ctx->state[1] = in[2];
++	sm3_ctx->state[2] = in[1];
++	sm3_ctx->state[3] = in[0];
++	sm3_ctx->state[4] = in[7];
++	sm3_ctx->state[5] = in[6];
++	sm3_ctx->state[6] = in[5];
++	sm3_ctx->state[7] = in[4];
++}
++
++
++static phytium_sm3_context * get_phytium_sm3_context(phytium_provctx *provctx, int desc_id)
++{
++	phytium_scto_context *pscto_ctx = GET_PHYTIUM_SCTO_CTX_PTR(provctx, desc_id);
++	return &(pscto_ctx->psm3_ctx);
++}
++
++int phytium_scto_sm3_init(SM3_CTX *sm3ctx)
++{
++	void *dma_buf = NULL;
++	phytium_sm3_context *psm3ctx;
++
++	int desc_id = sm3ctx->desc_id;
++	if (desc_id <= 0) {
++		dma_buf = phytium_scto_mem_alloc(sm3ctx);
++		if (dma_buf == NULL)
++			return -1;
++	}
++
++	if (sm3ctx->desc_id > SCTO_DESC_NUM)
++		return -1;
++
++	set_phytium_provctx_algo_with_descid(sm3ctx->provctx, desc_id, ALG_SM3);
++	psm3ctx = get_phytium_sm3_context(sm3ctx->provctx, desc_id);
++
++	_software_sm3_init(&psm3ctx->sm3_ctx);
++
++	if (dma_buf)
++		psm3ctx->v_dma_buf = dma_buf;
++	psm3ctx->user_count = (volatile int *)((long)(sm3ctx->provctx->common_info_start) +
++					   SCTO_DESC_NUM * 8 + 128);
++
++	return 0;
++}
++
++int phytium_scto_sm3_update(SM3_CTX *ctx, const uint8_t *data, unsigned int len)
++{
++	uint32_t left, fill, count, *src;
++	uint32_t calclen = 0, offset = 0, buf_len;
++	phytium_sm3_context *psm3ctx = NULL;
++	int ret = -1;
++	int desc_id = ctx->desc_id;
++	int phytium_scto_fd = GET_SCTO_PROVIDER_FD(ctx->provctx);
++
++	if (desc_id <= 0 || desc_id > SCTO_DESC_NUM || phytium_scto_fd < 0)
++		return -1;
++	if (data == NULL)
++		return -1;
++	if (len == 0)
++		return -1;
++
++
++	psm3ctx = get_phytium_sm3_context(ctx->provctx, desc_id);
++
++#if SCTO_ENABLE_SMALL_PACKKET_CIPHER_OFFLOADS
++	if ((len < 128) || __atomic_load_n(psm3ctx->user_count, __ATOMIC_SEQ_CST)) {
++		_software_sm3_update(&psm3ctx->sm3_ctx, data, len);
++		return 0;
++	}
++#endif
++
++	left = psm3ctx->sm3_ctx.total[0] & 0x3F;
++	fill = SM3_BLOCK_BYTE_LEN - left;
++
++	//update total byte length
++	psm3ctx->sm3_ctx.total[0] += len;
++	if (psm3ctx->sm3_ctx.total[0] < len)
++		psm3ctx->sm3_ctx.total[1]++;
++
++	if (left) {
++		if (len >= fill) {
++			memcpy(psm3ctx->sm3_ctx.buffer + left, data, fill);
++			len -= fill;
++			data += fill;
++		} else {
++			memcpy(psm3ctx->sm3_ctx.buffer + left, data, len);
++			return 0;
++		}
++	}
++
++	//process some blocks
++	count = len >> 6;
++
++	if (left) {
++		if (HASH_REVERSE(ctx->provctx)) {
++			smx_dma_reverse_word(psm3ctx->sm3_ctx.buffer,
++					     psm3ctx->v_dma_buf,
++					     SM3_BLOCK_WORD_LEN);
++		} else {
++			memcpy(psm3ctx->v_dma_buf, psm3ctx->sm3_ctx.buffer, 64);
++		}
++
++		left = SM3_BLOCK_BYTE_LEN;
++	}
++
++	calclen = count << 6;
++
++	while (calclen || left) {
++		if (calclen <= (PHYTIUM_SM3_DMA_SIZE - left)) {
++			buf_len = calclen + left;
++		} else {
++			buf_len = PHYTIUM_SM3_DMA_SIZE;
++		}
++
++		src = (uint32_t *)((long)data + offset);
++
++		if (HASH_REVERSE(ctx->provctx)) {
++			smx_dma_reverse_word(src,
++					     (uint8_t *)(psm3ctx->v_dma_buf) + left,
++					     (buf_len - left) >> 2);
++		} else {
++			memcpy((uint8_t *)(psm3ctx->v_dma_buf) + left, src,
++			       (buf_len - left));
++		}
++
++		// test_print_buf("Data", ctx->v_dma_buf, buf_len);
++
++		ret = ioctl(phytium_scto_fd, SCTO_SM3,
++			    ((long)desc_id << 32) | buf_len);
++		if (ret)
++			return -1;
++
++		if (HASH_REVERSE(ctx->provctx)) {
++			reverse_sm3_word(psm3ctx->v_dma_buf, &psm3ctx->sm3_ctx);
++		} else {
++			memcpy(&psm3ctx->sm3_ctx.state, psm3ctx->v_dma_buf, 32);
++		}
++
++		offset += (buf_len - left);
++		calclen -= (buf_len - left);
++		left = 0;
++	}
++
++	//process the remainder
++	data += count << 6;
++	len = len & 0x3F;
++	if (len) {
++		memcpy(psm3ctx->sm3_ctx.buffer, data, len);
++		memset(psm3ctx->sm3_ctx.buffer + len, 0, 64 - len);
++	}
++
++	return 0;
++}
++
++int phytium_scto_sm3_final(SM3_CTX *sm3ctx, uint8_t *out)
++{
++	int desc_id = sm3ctx->desc_id;
++	if (desc_id <= 0 || desc_id > SCTO_DESC_NUM)
++		return -1;
++
++	if (out == NULL)
++		return -1;
++
++	phytium_sm3_context *ctx = get_phytium_sm3_context(sm3ctx->provctx, desc_id);
++	_software_sm3_final(&ctx->sm3_ctx, out);
++
++	return 0;
++}
++
++// int phytium_scto_hmac_sm3_init(int *desc_id)
++// {
++// 	phytium_hmac_sm3_context *ctx;
++
++// 	if (desc_id == NULL)
++// 		return -1;
++
++// 	void *dma_buf = phytium_scto_mem_alloc(desc_id);
++// 	if (dma_buf == NULL)
++// 		return -1;
++
++// 	if (*desc_id > SCTO_DESC_NUM)
++// 		return -1;
++
++// 	phytium_desc_start[*desc_id / (0x400000 / sizeof(phytium_scto_context))]
++// 		[*desc_id & ((0x400000 / sizeof(phytium_scto_context)) - 1)]
++// 			.alg = ALG_HMAC_SM3;
++
++// 	ctx = &phytium_desc_start[*desc_id / (0x400000 / sizeof(phytium_scto_context))]
++// 		[*desc_id & ((0x400000 / sizeof(phytium_scto_context)) - 1)]
++// 			.phmac_sm3_ctx;
++
++// 	memset(ctx, 0, sizeof(phytium_hmac_sm3_context));
++// 	ctx->sm3_ctx.v_dma_buf = dma_buf;
++// 	ctx->desc_id = *desc_id;
++// 	ctx->inner_desc_id = -1;
++// 	ctx->state = HMAC_SM3_STATE_INITIALIZED;
++
++// 	return 0;
++// }
++
++// int phytium_scto_hmac_sm3_setkey(int desc_id,
++// 		const uint8_t *key, unsigned int keylen)
++// {
++// 	phytium_hmac_sm3_context *ctx;
++// 	uint8_t key_buffer[SM3_BLOCK_BYTE_LEN] = {0};
++// 	uint32_t i;
++// 	int ret = -1;
++// 	int temp_desc_id = -1;
++
++// 	if (desc_id <= 0 || desc_id > SCTO_DESC_NUM || key == NULL)
++// 		return -1;
++
++// 	ctx = &phytium_desc_start[desc_id / (0x400000 / sizeof(phytium_scto_context))]
++// 		[desc_id & ((0x400000 / sizeof(phytium_scto_context)) - 1)]
++// 			.phmac_sm3_ctx;
++
++// 	// 只允许在 INITIALIZED 状态下设置密钥
++// 	if (ctx->state != HMAC_SM3_STATE_INITIALIZED) {
++// 		switch (ctx->state) {
++// 		case HMAC_SM3_STATE_KEY_SET:
++// 			SCTO_LOG_ERR("HMAC-SM3 key already set. cannot set key again.\n");
++// 			break;
++// 		case HMAC_SM3_STATE_UPDATE:
++// 			SCTO_LOG_ERR("HMAC-SM3 update in progress. cannot set key after data update.\n");
++// 			break;
++// 		case HMAC_SM3_STATE_FINALIZED:
++// 			SCTO_LOG_ERR("HMAC-SM3 already finalized. context must be re-initialized.\n");
++// 			break;
++// 		default:
++// 			SCTO_LOG_ERR("HMAC-SM3 in invalid state for setting key.\n");
++// 			break;
++// 		}
++// 		goto cleanup;
++// 	}
++
++// 	if (keylen > SM3_BLOCK_BYTE_LEN) {
++// 		if (phytium_scto_sm3_init(&temp_desc_id) != 0)
++// 			goto cleanup;
++// 		if (phytium_scto_sm3_update(temp_desc_id, key, keylen) != 0)
++// 			goto cleanup;
++// 		if (phytium_scto_sm3_final(temp_desc_id, key_buffer) != 0)
++// 			goto cleanup;
++
++// 		keylen = SM3_DIGEST_BYTE_LEN;
++// 	} else {
++// 		memcpy(key_buffer, key, keylen);
++// 		if (keylen < SM3_BLOCK_BYTE_LEN)
++// 			memset(key_buffer + keylen, 0, SM3_BLOCK_BYTE_LEN - keylen);
++// 	}
++
++// 	// 生成内部填充密钥和外部填充密钥
++// 	for (i = 0; i < SM3_BLOCK_BYTE_LEN; i++) {
++// 		ctx->i_key_pad[i] = key_buffer[i] ^ 0x36;
++// 		ctx->o_key_pad[i] = key_buffer[i] ^ 0x5C;
++// 	}
++
++// 	if (phytium_scto_sm3_init(&ctx->inner_desc_id) != 0)
++// 		goto cleanup;
++// 	if (phytium_scto_sm3_update(ctx->inner_desc_id, ctx->i_key_pad, SM3_BLOCK_BYTE_LEN) != 0)
++// 		goto cleanup;
++
++// 	ctx->state = HMAC_SM3_STATE_KEY_SET;
++// 	ret = 0;
++
++// cleanup:
++
++// 	if (temp_desc_id > 0)
++// 		phytium_scto_mem_free(temp_desc_id);
++
++// 	if (ret != 0 && ctx->inner_desc_id > 0) {
++// 		phytium_scto_mem_free(ctx->inner_desc_id);
++// 		ctx->inner_desc_id = -1;
++// 	}
++
++// 	return ret;
++// }
++
++// int phytium_scto_hmac_sm3_update(int desc_id,
++// 						const uint8_t *data, unsigned int len)
++// {
++// 	phytium_hmac_sm3_context *ctx;
++
++// 	if (desc_id <= 0 || desc_id > SCTO_DESC_NUM || data == NULL)
++// 		return -1;
++
++// 	ctx = &phytium_desc_start[desc_id / (0x400000 / sizeof(phytium_scto_context))]
++// 		[desc_id & ((0x400000 / sizeof(phytium_scto_context)) - 1)]
++// 			.phmac_sm3_ctx;
++
++// 	if (ctx->state < HMAC_SM3_STATE_KEY_SET) {
++// 		SCTO_LOG_ERR("HMAC-SM3 context not initialized with key\n");
++// 		return -1;
++// 	}
++
++// 	// 如果是第一次更新数据，更新状态
++// 	if (ctx->state == HMAC_SM3_STATE_KEY_SET)
++// 		ctx->state = HMAC_SM3_STATE_UPDATE;
++
++// 	return phytium_scto_sm3_update(ctx->inner_desc_id, data, len);
++// }
++
++// int phytium_scto_hmac_sm3_final(int desc_id, uint8_t *out)
++// {
++// 	phytium_hmac_sm3_context *ctx;
++// 	uint8_t inner_hash[SM3_DIGEST_BYTE_LEN];
++// 	int outer_desc_id = -1;
++// 	int ret = 0;
++
++// 	if (desc_id <= 0 || desc_id > SCTO_DESC_NUM || out == NULL)
++// 		return -1;
++
++// 	ctx = &phytium_desc_start[desc_id / (0x400000 / sizeof(phytium_scto_context))]
++// 		[desc_id & ((0x400000 / sizeof(phytium_scto_context)) - 1)]
++// 			.phmac_sm3_ctx;
++
++// 	if (ctx->state < HMAC_SM3_STATE_KEY_SET) {
++// 		SCTO_LOG_ERR("HMAC-SM3 context not initialized with key\n");
++// 		return -1;
++// 	}
++
++// 	// 完成内部哈希计算，得到inner_hash
++// 	if (phytium_scto_sm3_final(ctx->inner_desc_id, inner_hash) != 0) {
++// 		ret = -1;
++// 		goto cleanup;
++// 	}
++
++// 	// 初始化外部哈希
++// 	if (phytium_scto_sm3_init(&outer_desc_id) != 0) {
++// 		ret = -1;
++// 		goto cleanup;
++// 	}
++
++// 	// 处理外部填充密钥
++// 	if (phytium_scto_sm3_update(outer_desc_id, ctx->o_key_pad, SM3_BLOCK_BYTE_LEN) != 0) {
++// 		ret = -1;
++// 		goto cleanup;
++// 	}
++
++// 	// 将内部哈希结果inner_hash添加到外部哈希计算中，处理内部哈希结果
++// 	if (phytium_scto_sm3_update(outer_desc_id, inner_hash, SM3_DIGEST_BYTE_LEN) != 0) {
++// 		ret = -1;
++// 		goto cleanup;
++// 	}
++
++// 	// 完成外部哈希计算，得到最终的HMAC值
++// 	if (phytium_scto_sm3_final(outer_desc_id, out) != 0) {
++// 		ret = -1;
++// 		goto cleanup;
++// 	}
++
++// cleanup:
++
++// 	if (outer_desc_id > 0)
++// 		phytium_scto_mem_free(outer_desc_id);
++
++// 	if (ctx->inner_desc_id > 0) {
++// 		phytium_scto_mem_free(ctx->inner_desc_id);
++// 		ctx->inner_desc_id = -1;
++// 	}
++
++// 	ctx->state = HMAC_SM3_STATE_INITIALIZED;
++
++// 	return ret;
++// }
++
++
++static void *sm3_newctx(void *provctx)
++{
++	SM3_CTX *ctx = OPENSSL_zalloc(sizeof(SM3_CTX));
++	if (ctx == NULL) {
++		//ERR_raise(ERR_LIB_PROV, )
++		return NULL;
++	}
++	ctx->provctx = provctx;
++	return ctx;
++}
++
++static void sm3_freectx(void *vctx)
++{
++	SM3_CTX *ctx =(SM3_CTX*)vctx;
++	if (ctx != NULL) {
++		OPENSSL_free(ctx);
++	}
++}
++
++static int sm3_init(void *vctx)
++{
++	SM3_CTX *ctx =(SM3_CTX*)vctx;
++	int ret = phytium_scto_sm3_init(ctx);
++	if (ret < 0) return 0;
++	return 1;
++}
++
++static int sm3_update(void *vctx, const unsigned char *data, size_t datalen)
++{
++    SM3_CTX *ctx = (SM3_CTX *)vctx;
++    if (ctx == NULL || data == NULL) return 0;
++	int ret = phytium_scto_sm3_update(ctx, data, datalen);
++	if ( ret < 0) return 0;
++	return 1;
++}
++
++static int sm3_final(void *vctx, unsigned char *out, size_t *outl,  size_t outsize)
++{
++    SM3_CTX *ctx = (SM3_CTX *)vctx;
++    if (ctx == NULL || out == NULL || outl == NULL) return 0;
++	if (outsize < SM3_DIGEST_LENGTH) {
++        *outl = SM3_DIGEST_LENGTH;
++        return 0;
++    }
++
++    int ret = phytium_scto_sm3_final(ctx, out);
++	if ( ret < 0 ){
++		return 0;
++	}
++    *outl = SM3_DIGEST_LENGTH;
++    return 1;
++}
++
++
++// 方法派发表
++const OSSL_DISPATCH phytium_sm3_functions[] = {
++    { OSSL_FUNC_DIGEST_NEWCTX, (void (*)(void))sm3_newctx },
++    { OSSL_FUNC_DIGEST_INIT, (void (*)(void))sm3_init },
++    { OSSL_FUNC_DIGEST_UPDATE, (void (*)(void))sm3_update },
++    { OSSL_FUNC_DIGEST_FINAL, (void (*)(void))sm3_final },
++    { OSSL_FUNC_DIGEST_FREECTX, (void (*)(void))sm3_freectx },
++    { 0, NULL }
++};
+\ No newline at end of file
+Index: b/providers/phytium/sm3_phytium.h
+===================================================================
+--- /dev/null
++++ b/providers/phytium/sm3_phytium.h
+@@ -0,0 +1,41 @@
++#ifndef _SM3_PHYTIUM_H_
++#define _SM3_PHYTIUM_H_
++
++#include <stdint.h>
++#include <stddef.h>
++#include <openssl/types.h>
++#include <openssl/core.h>
++
++
++/*API*/
++// int phytium_scto_sm3_init(int *desc_id);
++// int phytium_scto_sm3_update(int desc_id, const uint8_t *data, unsigned int len);
++// int phytium_scto_sm3_final(int desc_id, uint8_t *out);
++
++// int phytium_scto_hmac_sm3_init(int *desc_id);
++// int phytium_scto_hmac_sm3_update(int desc_id, const uint8_t *data, unsigned int len);
++// int phytium_scto_hmac_sm3_final(int desc_id, uint8_t *out);
++// int phytium_scto_hmac_sm3_setkey(int desc_id, const uint8_t *key, unsigned int keylen);
++
++// typedef struct _sm3_context {
++// 	uint32_t total[2]; /* number of bytes processed */
++// 	uint32_t state[8]; /* intermediate digest state */
++// 	uint8_t buffer[64]; /* data block being processed */
++// 	uint8_t ipad[64];
++// 	uint8_t opad[64];
++// } _sm3_context;
++
++// typedef struct sm3_ctx {
++// 	void *provctx;
++// 	int desc_id;
++// } SM3_CTX;
++
++//void _software_sm3_init(struct _sm3_context *ctx);
++
++//void _process_software_sm3(struct _sm3_context *ctx, const uint8_t data[64]);
++
++//void _software_sm3_update(struct _sm3_context *ctx, const uint8_t *input, size_t ilen);
++
++//void _software_sm3_final(struct _sm3_context *ctx, uint8_t output[32]);
++
++#endif
+\ No newline at end of file
+Index: b/providers/phytium/sm4_phytium.c
+===================================================================
+--- /dev/null
++++ b/providers/phytium/sm4_phytium.c
+@@ -0,0 +1,919 @@
++#include "smx_common.h"
++#include <openssl/core_dispatch.h>
++#include "prov/ciphercommon.h"
++//#include "lib_phytium_log.h"
++
++
++/*
++ * Expanded SM4 S-boxes
++ */
++static const uint8_t SboxTable[16][16] = {
++	{ 0xd6, 0x90, 0xe9, 0xfe, 0xcc, 0xe1, 0x3d, 0xb7, 0x16, 0xb6, 0x14,
++	  0xc2, 0x28, 0xfb, 0x2c, 0x05 },
++	{ 0x2b, 0x67, 0x9a, 0x76, 0x2a, 0xbe, 0x04, 0xc3, 0xaa, 0x44, 0x13,
++	  0x26, 0x49, 0x86, 0x06, 0x99 },
++	{ 0x9c, 0x42, 0x50, 0xf4, 0x91, 0xef, 0x98, 0x7a, 0x33, 0x54, 0x0b,
++	  0x43, 0xed, 0xcf, 0xac, 0x62 },
++	{ 0xe4, 0xb3, 0x1c, 0xa9, 0xc9, 0x08, 0xe8, 0x95, 0x80, 0xdf, 0x94,
++	  0xfa, 0x75, 0x8f, 0x3f, 0xa6 },
++	{ 0x47, 0x07, 0xa7, 0xfc, 0xf3, 0x73, 0x17, 0xba, 0x83, 0x59, 0x3c,
++	  0x19, 0xe6, 0x85, 0x4f, 0xa8 },
++	{ 0x68, 0x6b, 0x81, 0xb2, 0x71, 0x64, 0xda, 0x8b, 0xf8, 0xeb, 0x0f,
++	  0x4b, 0x70, 0x56, 0x9d, 0x35 },
++	{ 0x1e, 0x24, 0x0e, 0x5e, 0x63, 0x58, 0xd1, 0xa2, 0x25, 0x22, 0x7c,
++	  0x3b, 0x01, 0x21, 0x78, 0x87 },
++	{ 0xd4, 0x00, 0x46, 0x57, 0x9f, 0xd3, 0x27, 0x52, 0x4c, 0x36, 0x02,
++	  0xe7, 0xa0, 0xc4, 0xc8, 0x9e },
++	{ 0xea, 0xbf, 0x8a, 0xd2, 0x40, 0xc7, 0x38, 0xb5, 0xa3, 0xf7, 0xf2,
++	  0xce, 0xf9, 0x61, 0x15, 0xa1 },
++	{ 0xe0, 0xae, 0x5d, 0xa4, 0x9b, 0x34, 0x1a, 0x55, 0xad, 0x93, 0x32,
++	  0x30, 0xf5, 0x8c, 0xb1, 0xe3 },
++	{ 0x1d, 0xf6, 0xe2, 0x2e, 0x82, 0x66, 0xca, 0x60, 0xc0, 0x29, 0x23,
++	  0xab, 0x0d, 0x53, 0x4e, 0x6f },
++	{ 0xd5, 0xdb, 0x37, 0x45, 0xde, 0xfd, 0x8e, 0x2f, 0x03, 0xff, 0x6a,
++	  0x72, 0x6d, 0x6c, 0x5b, 0x51 },
++	{ 0x8d, 0x1b, 0xaf, 0x92, 0xbb, 0xdd, 0xbc, 0x7f, 0x11, 0xd9, 0x5c,
++	  0x41, 0x1f, 0x10, 0x5a, 0xd8 },
++	{ 0x0a, 0xc1, 0x31, 0x88, 0xa5, 0xcd, 0x7b, 0xbd, 0x2d, 0x74, 0xd0,
++	  0x12, 0xb8, 0xe5, 0xb4, 0xb0 },
++	{ 0x89, 0x69, 0x97, 0x4a, 0x0c, 0x96, 0x77, 0x7e, 0x65, 0xb9, 0xf1,
++	  0x09, 0xc5, 0x6e, 0xc6, 0x84 },
++	{ 0x18, 0xf0, 0x7d, 0xec, 0x3a, 0xdc, 0x4d, 0x20, 0x79, 0xee, 0x5f,
++	  0x3e, 0xd7, 0xcb, 0x39, 0x48 }
++};
++
++/* System parameter */
++static const uint32_t FK[4] = { 0xa3b1bac6, 0x56aa3350, 0x677d9197,
++				0xb27022dc };
++
++/* Fixed parameter */
++static const uint32_t CK[32] = {
++	0x00070e15, 0x1c232a31, 0x383f464d, 0x545b6269, 0x70777e85, 0x8c939aa1,
++	0xa8afb6bd, 0xc4cbd2d9, 0xe0e7eef5, 0xfc030a11, 0x181f262d, 0x343b4249,
++	0x50575e65, 0x6c737a81, 0x888f969d, 0xa4abb2b9, 0xc0c7ced5, 0xdce3eaf1,
++	0xf8ff060d, 0x141b2229, 0x30373e45, 0x4c535a61, 0x686f767d, 0x848b9299,
++	0xa0a7aeb5, 0xbcc3cad1, 0xd8dfe6ed, 0xf4fb0209, 0x10171e25, 0x2c333a41,
++	0x484f565d, 0x646b7279
++};
++
++static inline uint8_t sm4_sbox(uint8_t inch)
++{
++	uint8_t *tab = (uint8_t *)SboxTable;
++
++	return tab[inch];
++}
++
++static inline uint32_t sm4_lt(uint32_t ka)
++{
++	uint32_t bb = 0;
++	uint8_t a[4];
++	uint8_t b[4];
++
++	PUT_UINT32_BE(ka, a, 0);
++	b[0] = sm4_sbox(a[0]);
++	b[1] = sm4_sbox(a[1]);
++	b[2] = sm4_sbox(a[2]);
++	b[3] = sm4_sbox(a[3]);
++	GET_UINT32_BE(bb, b, 0);
++
++	return bb ^ ROTL(bb, 2) ^ ROTL(bb, 10) ^ ROTL(bb, 18) ^ ROTL(bb, 24);
++}
++
++static inline uint32_t sm4_f(uint32_t x0, uint32_t x1, uint32_t x2, uint32_t x3,
++			     uint32_t rk)
++{
++	return x0 ^ sm4_lt(x1 ^ x2 ^ x3 ^ rk);
++}
++
++static uint32_t sm4_calcirk(uint32_t ka)
++{
++	uint32_t bb = 0;
++	uint8_t a[4];
++	uint8_t b[4];
++
++	PUT_UINT32_BE(ka, a, 0);
++	b[0] = sm4_sbox(a[0]);
++	b[1] = sm4_sbox(a[1]);
++	b[2] = sm4_sbox(a[2]);
++	b[3] = sm4_sbox(a[3]);
++	GET_UINT32_BE(bb, b, 0);
++
++	return bb ^ ROTL(bb, 13) ^ ROTL(bb, 23);
++}
++
++static void sm4_setkey(uint32_t SK[32], const uint8_t key[16])
++{
++	uint32_t MK[4];
++	uint32_t k[36];
++	uint32_t i = 0;
++
++	GET_UINT32_BE(MK[0], key, 0);
++	GET_UINT32_BE(MK[1], key, 4);
++	GET_UINT32_BE(MK[2], key, 8);
++	GET_UINT32_BE(MK[3], key, 12);
++
++	k[0] = MK[0] ^ FK[0];
++	k[1] = MK[1] ^ FK[1];
++	k[2] = MK[2] ^ FK[2];
++	k[3] = MK[3] ^ FK[3];
++
++	for (i = 0; i < 32; i++) {
++		k[i + 4] = k[i] ^
++			   sm4_calcirk(k[i + 1] ^ k[i + 2] ^ k[i + 3] ^ CK[i]);
++		SK[i] = k[i + 4];
++	}
++}
++
++static inline void sm4_one_round(uint32_t sk[32], const uint8_t input[16],
++				 uint8_t output[16])
++{
++	uint32_t i = 0;
++	uint32_t ulbuf[36];
++
++	memset(ulbuf, 0, sizeof(ulbuf));
++
++	GET_UINT32_BE(ulbuf[0], input, 0);
++	GET_UINT32_BE(ulbuf[1], input, 4);
++	GET_UINT32_BE(ulbuf[2], input, 8);
++	GET_UINT32_BE(ulbuf[3], input, 12);
++
++	for (i = 0; i < 32; i++)
++		ulbuf[i + 4] = sm4_f(ulbuf[i], ulbuf[i + 1], ulbuf[i + 2],
++				     ulbuf[i + 3], sk[i]);
++
++	PUT_UINT32_BE(ulbuf[35], output, 0);
++	PUT_UINT32_BE(ulbuf[34], output, 4);
++	PUT_UINT32_BE(ulbuf[33], output, 8);
++	PUT_UINT32_BE(ulbuf[32], output, 12);
++}
++
++void sm4_setkey_enc(struct _sm4_context *ctx, const uint8_t key[16])
++{
++	sm4_setkey(ctx->encsk, key);
++}
++
++void sm4_setkey_dec(struct _sm4_context *ctx, const uint8_t key[16])
++{
++	int i;
++
++	sm4_setkey(ctx->decsk, key);
++
++	for (i = 0; i < 16; i++)
++		SWAP(ctx->decsk[i], ctx->decsk[31 - i]);
++}
++
++void sm4_crypt_ecb_enc(struct _sm4_context *ctx, size_t length, uint8_t iv[16],
++		       const uint8_t *input, uint8_t *output)
++{
++	while (length > 0) {
++		sm4_one_round(ctx->encsk, input, output);
++		input += 16;
++		output += 16;
++		length -= 16;
++	}
++}
++
++void sm4_crypt_ecb_dec(struct _sm4_context *ctx, size_t length, uint8_t iv[16],
++		       const uint8_t *input, uint8_t *output)
++{
++	while (length > 0) {
++		sm4_one_round(ctx->decsk, input, output);
++		input += 16;
++		output += 16;
++		length -= 16;
++	}
++}
++
++void sm4_crypt_cbc_enc(struct _sm4_context *ctx, size_t length, uint8_t iv[16],
++		       const uint8_t *input, uint8_t *output)
++{
++	int i;
++
++	while (length > 0) {
++		for (i = 0; i < 16; i++)
++			output[i] = (uint8_t)(input[i] ^ iv[i]);
++		sm4_one_round(ctx->encsk, output, output);
++		memcpy(iv, output, 16);
++		input += 16;
++		output += 16;
++		length -= 16;
++	}
++}
++
++void sm4_crypt_cbc_dec(struct _sm4_context *ctx, size_t length, uint8_t iv[16],
++		       const uint8_t *input, uint8_t *output)
++{
++	int i;
++	uint8_t temp[16];
++
++	while (length > 0) {
++		memcpy(temp, input, 16);
++		sm4_one_round(ctx->decsk, input, output);
++		for (i = 0; i < 16; i++)
++			output[i] = (uint8_t)(output[i] ^ iv[i]);
++		memcpy(iv, temp, 16);
++		input += 16;
++		output += 16;
++		length -= 16;
++	}
++}
++
++void sm4_crypt_ctr(struct _sm4_context *ctx, size_t length, uint8_t ctr[16],
++		   const uint8_t *input, uint8_t *output)
++{
++	int i;
++	uint8_t temp[16];
++
++	while (length > 0) {
++		memcpy(temp, ctr, 16);
++		sm4_one_round(ctx->encsk, ctr, ctr);
++		for (i = 0; i < 16; i++)
++			output[i] = (uint8_t)(input[i] ^ ctr[i]);
++		memcpy(ctr, temp, 16);
++		for (i = 16; i > 0; i--)
++			if (++ctr[i - 1])
++				break;
++		input += 16;
++		output += 16;
++		length -= 16;
++	}
++}
++
++static phytium_sm4_context * get_phytium_sm4_context(phytium_provctx *provctx, int desc_id)
++{
++	phytium_scto_context *pscto_ctx = GET_PHYTIUM_SCTO_CTX_PTR(provctx, desc_id);
++	return &(pscto_ctx->psm4_ctx);
++}
++
++static int phytium_scto_sm4_ecb(SM4_CTX *sm4ctx, const uint8_t *in, uint32_t len,
++				uint8_t *out)
++{
++	uint32_t offset, buf_len;
++	int ret = -1;
++
++	int desc_id = sm4ctx->desc_id;
++	phytium_sm4_context *psm4ctx = get_phytium_sm4_context(sm4ctx, desc_id);
++
++#if SCTO_ENABLE_SMALL_PACKKET_CIPHER_OFFLOADS
++	if ((len < 256) || __atomic_load_n(psm4ctx->user_count, __ATOMIC_SEQ_CST)) {
++		if (psm4ctx->cryptomode == SM4_CRYPTO_DECRYPT)
++			sm4_crypt_ecb_dec(&psm4ctx->sm4_ctx, len, NULL, in, out);
++		else
++			sm4_crypt_ecb_enc(&psm4ctx->sm4_ctx, len, NULL, in, out);
++		return 0;
++	}
++#endif
++
++	offset = 0;
++	while (len) {
++		if (len <= PHYTIUM_SM4_DMA_SIZE) {
++			buf_len = len;
++		} else {
++			buf_len = PHYTIUM_SM4_DMA_SIZE;
++		}
++
++#if SCTO_ENABLE_SMALL_PACKKET_CIPHER_OFFLOADS
++		if (buf_len < 256) {
++			if (psm4ctx->cryptomode == SM4_CRYPTO_DECRYPT)
++				sm4_crypt_ecb_dec(&psm4ctx->sm4_ctx, buf_len, NULL,
++						  in + offset, out + offset);
++			else
++				sm4_crypt_ecb_enc(&psm4ctx->sm4_ctx, buf_len, NULL,
++						  in + offset, out + offset);
++
++			break;
++		}
++#endif
++
++		int phytium_scto_fd = GET_SCTO_PROVIDER_FD(sm4ctx->provctx);
++		if (SKE_REVERSE(sm4ctx->provctx)) {
++			smx_dma_reverse_word(in + offset, psm4ctx->v_dma_buf,
++					     buf_len >> 2);
++			ret = ioctl(phytium_scto_fd, SCTO_SM4,
++				    ((long)desc_id << 32) | buf_len);
++			if (ret)
++				return -1;
++			smx_dma_reverse_word(psm4ctx->v_dma_buf, out + offset,
++					     buf_len >> 2);
++		} else {
++			memcpy(psm4ctx->v_dma_buf, in + offset, buf_len);
++
++			ret = ioctl(phytium_scto_fd, SCTO_SM4,
++				    ((long)desc_id << 32) | buf_len);
++			if (ret)
++				return -1;
++			memcpy(out + offset, psm4ctx->v_dma_buf, buf_len);
++		}
++
++		len -= buf_len;
++		offset += buf_len;
++	}
++
++	return 0;
++}
++
++static int phytium_scto_sm4_cbc(SM4_CTX *sm4ctx, const uint8_t *in, uint32_t len,
++				uint8_t *out)
++{
++	uint32_t offset, buf_len;
++	int ret = -1;
++
++	int desc_id = sm4ctx->desc_id;
++	phytium_sm4_context *psm4ctx = get_phytium_sm4_context(sm4ctx, desc_id);
++
++#if SCTO_ENABLE_SMALL_PACKKET_CIPHER_OFFLOADS
++	if ((len < 256) || __atomic_load_n(psm4ctx->user_count, __ATOMIC_SEQ_CST)) {
++		if (psm4ctx->cryptomode == SM4_CRYPTO_DECRYPT)
++			sm4_crypt_cbc_dec(&psm4ctx->sm4_ctx, len, psm4ctx->iv, in, out);
++		else
++			sm4_crypt_cbc_enc(&psm4ctx->sm4_ctx, len, psm4ctx->iv, in, out);
++		return 0;
++	}
++#endif
++
++	offset = 0;
++	while (len) {
++		if (len <= PHYTIUM_SM4_DMA_SIZE) {
++			buf_len = len;
++		} else {
++			buf_len = PHYTIUM_SM4_DMA_SIZE;
++		}
++
++#if SCTO_ENABLE_SMALL_PACKKET_CIPHER_OFFLOADS
++		if (buf_len < 256) {
++			if (psm4ctx->cryptomode == SM4_CRYPTO_DECRYPT)
++				sm4_crypt_cbc_dec(&psm4ctx->sm4_ctx, buf_len,
++						  psm4ctx->iv, in + offset,
++						  out + offset);
++			else
++				sm4_crypt_cbc_enc(&psm4ctx->sm4_ctx, buf_len,
++						  psm4ctx->iv, in + offset,
++						  out + offset);
++
++			break;
++		}
++#endif
++		int phytium_scto_fd = GET_SCTO_PROVIDER_FD(sm4ctx->provctx);
++		if (SKE_REVERSE(sm4ctx->provctx)) {
++			smx_dma_reverse_word(in + offset, psm4ctx->v_dma_buf,
++					     buf_len >> 2);
++			ret = ioctl(phytium_scto_fd, SCTO_SM4,
++				    ((long)desc_id << 32) | buf_len);
++			if (ret)
++				return -1;
++
++			if (psm4ctx->cryptomode)
++				memcpy(psm4ctx->iv, in + offset + buf_len - 16, 16);
++			smx_dma_reverse_word(psm4ctx->v_dma_buf, out + offset,
++					     buf_len >> 2);
++
++		} else {
++			memcpy(psm4ctx->v_dma_buf, in + offset, buf_len);
++
++			ret = ioctl(phytium_scto_fd, SCTO_SM4,
++				    ((long)desc_id << 32) | buf_len);
++			if (ret)
++				return -1;
++
++			if (psm4ctx->cryptomode)
++				memcpy(psm4ctx->iv, in + offset + buf_len - 16, 16);
++
++			memcpy(out + offset, psm4ctx->v_dma_buf, buf_len);
++		}
++
++		len -= buf_len;
++		offset += buf_len;
++
++		if (!psm4ctx->cryptomode)
++			memcpy(psm4ctx->iv, out + offset - 16, 16);
++	}
++
++	return 0;
++}
++
++static int _sm4_ctr_small_packet(SM4_CTX *sm4ctx, const uint8_t *in, uint32_t len,
++				 uint8_t *out)
++{
++	uint32_t offset = 0, buf_len, ctr_len, i, left, fill;
++	int ret = -1;
++	uint8_t tempiv[16], temp[16];
++	int desc_id = sm4ctx->desc_id;
++	phytium_sm4_context *psm4ctx = get_phytium_sm4_context(sm4ctx, desc_id);
++
++	left = psm4ctx->total_len & 0xf;
++	fill = 16 - left;
++	psm4ctx->total_len += len;
++	if (left) {
++		if (len >= fill) {
++			memcpy(temp + left, in + offset, fill);
++			sm4_crypt_ctr(&psm4ctx->sm4_ctx, 16, psm4ctx->iv, temp, temp);
++			memcpy(out + offset, temp + left, fill);
++			len -= fill;
++			offset += fill;
++		} else {
++			// no change iv
++			memcpy(tempiv, psm4ctx->iv, 16);
++			memcpy(temp + left, in + offset, len);
++			sm4_crypt_ctr(&psm4ctx->sm4_ctx, 16, tempiv, temp, temp);
++			memcpy(out + offset, temp + left, len);
++			return 0;
++		}
++	}
++
++	left = len & 0xf;
++	len -= left;
++	while (len) {
++		if (len <= PHYTIUM_SM4_DMA_SIZE) {
++			buf_len = len;
++		} else {
++			buf_len = PHYTIUM_SM4_DMA_SIZE;
++		}
++
++		sm4_crypt_ctr(&psm4ctx->sm4_ctx, buf_len, psm4ctx->iv, in + offset,
++			      out + offset);
++		len -= buf_len;
++		offset += buf_len;
++	}
++
++	if (left) {
++		memcpy(tempiv, psm4ctx->iv, 16);
++		memcpy(temp, in + offset, left);
++		sm4_crypt_ctr(&psm4ctx->sm4_ctx, 16, tempiv, temp, temp);
++		memcpy(out + offset, temp, left);
++	}
++
++	return 0;
++}
++
++static int phytium_scto_sm4_ctr(SM4_CTX *sm4ctx, const uint8_t *in, uint32_t len,
++				uint8_t *out)
++{
++	uint32_t offset = 0, buf_len, ctr_len, i, left, fill;
++	uint8_t tmp, *iv;
++	uint32_t num;
++	int over = 0;
++	int ret = -1;
++	uint8_t temp[16], tempiv[16];
++
++	int desc_id = sm4ctx->desc_id;
++	phytium_sm4_context *psm4ctx = get_phytium_sm4_context(sm4ctx, desc_id);
++
++#if SCTO_ENABLE_SMALL_PACKKET_CIPHER_OFFLOADS
++	if ((len < 256) || __atomic_load_n(psm4ctx->user_count, __ATOMIC_SEQ_CST)) {
++		return _sm4_ctr_small_packet(desc_id, in, len, out);
++	}
++#endif
++
++	left = psm4ctx->total_len & 0xf;
++	fill = 16 - left;
++	psm4ctx->total_len += len;
++	if (left) {
++		if (len >= fill) {
++			memcpy(temp + left, in + offset, fill);
++			sm4_crypt_ctr(&psm4ctx->sm4_ctx, 16, psm4ctx->iv, temp, temp);
++			memcpy(out + offset, temp + left, fill);
++			len -= fill;
++			offset += fill;
++		} else {
++			// no change iv
++			memcpy(tempiv, psm4ctx->iv, 16);
++			memcpy(temp + left, in + offset, len);
++			sm4_crypt_ctr(&psm4ctx->sm4_ctx, 16, tempiv, temp, temp);
++			memcpy(out + offset, temp + left, len);
++			return 0;
++		}
++	}
++
++	num = len & 0xf;
++	len -= num;
++
++	int phytium_scto_fd = GET_SCTO_PROVIDER_FD(sm4ctx->provctx);
++	while (len) {
++		if (len <= PHYTIUM_SM4_DMA_SIZE) {
++			buf_len = len;
++		} else {
++			buf_len = PHYTIUM_SM4_DMA_SIZE;
++		}
++
++
++		if (SKE_REVERSE(sm4ctx->provctx)) {
++			smx_dma_reverse_word(in + offset, psm4ctx->v_dma_buf,
++					     buf_len >> 2);
++		} else {
++			memcpy(psm4ctx->v_dma_buf, in + offset, buf_len);
++		}
++
++		ret = ioctl(phytium_scto_fd, SCTO_SM4,
++			    ((long)desc_id << 32) | buf_len);
++		if (ret)
++			return -1;
++
++		iv = (uint8_t *)psm4ctx->iv;
++		ctr_len = buf_len >> 4;
++		for (i = 15; i >= 0; i--) {
++			tmp = iv[i];
++			if (ctr_len) {
++				iv[i] += ctr_len;
++				ctr_len >>= 8;
++			}
++
++			if (tmp > iv[i]) {
++				ctr_len++;
++				if (i == 12)
++					over = 1;
++			} else if (!ctr_len) {
++				break;
++			}
++		}
++
++		if (SKE_REVERSE(sm4ctx->provctx)) {
++			if (over) {
++				over = 0;
++				ctr_len = swap32(*(uint32_t *)(&iv[12]));
++				ctr_len <<= 4;
++				*(uint32_t *)(&iv[12]) = 0;
++				smx_dma_reverse_word(psm4ctx->v_dma_buf,
++						     out + offset,
++						     (buf_len - ctr_len) >> 2);
++				if (ctr_len) {
++					smx_dma_reverse_word(
++						in + offset +
++							(buf_len - ctr_len),
++						psm4ctx->v_dma_buf, ctr_len >> 2);
++					ret = ioctl(phytium_scto_fd, SCTO_SM4,
++						    ((long)desc_id << 32) |
++							    ctr_len);
++					if (ret)
++						return -1;
++					smx_dma_reverse_word(
++						psm4ctx->v_dma_buf,
++						out + offset +
++							(buf_len - ctr_len),
++						ctr_len >> 2);
++					ctr_len >>= 4;
++					*(uint32_t *)(&iv[12]) =
++						swap32(ctr_len);
++				}
++			} else {
++				smx_dma_reverse_word(psm4ctx->v_dma_buf,
++						     out + offset,
++						     buf_len >> 2);
++			}
++		} else {
++			memcpy(out + offset, psm4ctx->v_dma_buf, buf_len);
++		}
++
++		len -= buf_len;
++		offset += buf_len;
++	}
++
++	if (num) {
++		memcpy(tempiv, psm4ctx->iv, 16);
++		memcpy(temp, in + offset, num);
++		sm4_crypt_ctr(&psm4ctx->sm4_ctx, 16, tempiv, temp, temp);
++		memcpy(out + offset, temp, num);
++	}
++
++	return 0;
++}
++
++#define get
++
++int phytium_scto_sm4_init(SM4_CTX *sm4ctx, uint32_t mode, uint32_t cryptomode,
++			  const uint8_t *key, const uint8_t *iv)
++{
++	phytium_sm4_context *psm4ctx;
++	void *dma_buf = NULL;
++
++	int desc_id = sm4ctx->desc_id;
++	if ((mode != SM4_MODE_ECB) && (mode != SM4_MODE_CBC) &&
++	    (mode != SM4_MODE_CTR))
++		return -1;
++	if (cryptomode > SM4_CRYPTO_DECRYPT || desc_id == NULL)
++		return -1;
++
++	if (key == NULL)
++		return -1;
++
++	if (desc_id > SCTO_DESC_NUM)
++		return -1;
++
++	if (desc_id <= 0) {
++		dma_buf = phytium_scto_mem_alloc(sm4ctx);
++		if (dma_buf == NULL)
++			return -1;
++	}
++
++	set_phytium_provctx_algo_with_descid(sm4ctx->provctx, desc_id, ALG_SM4);
++	psm4ctx = get_phytium_sm4_context(sm4ctx->provctx, desc_id);
++
++	if (iv)
++		memcpy(psm4ctx->oiv, iv, 16);
++
++	memcpy(psm4ctx->iv, psm4ctx->oiv, 16);
++	psm4ctx->total_len = 0;
++
++	psm4ctx->mode = mode;
++	psm4ctx->cryptomode = cryptomode;
++
++	memcpy(psm4ctx->scto_key, key, sizeof(psm4ctx->scto_key));
++	sm4_setkey_enc(&psm4ctx->sm4_ctx, key);
++	sm4_setkey_dec(&psm4ctx->sm4_ctx, key);
++
++	if (SKE_REVERSE(sm4ctx->provctx))
++		smx_reverse_word(psm4ctx->scto_key, psm4ctx->scto_key,
++				 SM4_KEY_WORD_LEN);
++
++	if (dma_buf)
++		psm4ctx->v_dma_buf = dma_buf;
++
++	psm4ctx->user_count = (volatile int *)((long)(sm4ctx->provctx->common_info_start) +
++					   SCTO_DESC_NUM * 8 + 128);
++
++	return 0;
++}
++
++int phytium_scto_sm4_update(SM4_CTX *sm4ctx, const uint8_t *in, uint32_t len,
++			    uint8_t *out)
++{
++	int desc_id = sm4ctx->desc_id;
++	int phytium_scto_fd = GET_SCTO_PROVIDER_FD(sm4ctx->provctx);
++	if (desc_id <= 0 || desc_id > SCTO_DESC_NUM || phytium_scto_fd < 0)
++		return -1;
++
++	if (len == 0)
++		return -1;
++
++	if (in == NULL || out == NULL)
++		return -1;
++
++	phytium_sm4_context *psm4ctx = get_phytium_sm4_context(sm4ctx->provctx, desc_id);
++
++	switch (psm4ctx->mode) {
++	case SM4_MODE_ECB:
++		if (len & 0xf)
++			return -1;
++		return phytium_scto_sm4_ecb(desc_id, in, len, out);
++	case SM4_MODE_CBC:
++		if (len & 0xf)
++			return -1;
++		return phytium_scto_sm4_cbc(desc_id, in, len, out);
++	case SM4_MODE_CTR:
++		return phytium_scto_sm4_ctr(desc_id, in, len, out);
++	default:
++		break;
++	}
++
++	return -1;
++}
++
++static void *sm4_newctx(void *provctx)
++{
++	SM4_CTX *ctx = OPENSSL_zalloc(sizeof(SM4_CTX));
++	if (ctx == NULL) {
++		//ERR_raise(ERR_LIB_PROV, )
++		return NULL;
++	}
++	ctx->provctx = provctx;
++	return ctx;
++}
++
++static void sm4_freectx(void *vctx)
++{
++	SM4_CTX *ctx =(SM4_CTX*)vctx;
++	if (ctx != NULL) {
++		OPENSSL_free(ctx);
++	}
++}
++
++
++static int sm4ecb_einit(void *vctx, const unsigned char *key,
++                        size_t keylen, const unsigned char *iv,
++                        size_t ivlen, const OSSL_PARAM params[])
++{
++	SM4_CTX *ctx = (SM4_CTX*)vctx;
++    if (!ossl_prov_is_running())
++        return 0;
++	int ret = phytium_scto_sm4_init(ctx, SM4_MODE_ECB, SM4_CRYPTO_ENCRYPT, key, iv);
++	if (ret < 0) {
++		return 0;
++	}
++	return 1;
++}
++
++static int sm4ecb_dinit(void *vctx, const unsigned char *key,
++                        size_t keylen, const unsigned char *iv,
++                        size_t ivlen, const OSSL_PARAM params[])
++{
++	SM4_CTX *ctx = (SM4_CTX*)vctx;
++    if (!ossl_prov_is_running())
++        return 0;
++	int ret = phytium_scto_sm4_init(ctx, SM4_MODE_ECB, SM4_CRYPTO_DECRYPT, key, iv);
++	if (ret < 0) {
++		return 0;
++	}
++	return 1;
++}
++
++static int sm4ecb_update(void *vctx, unsigned char *out,
++                 size_t *outl, size_t outsize,
++                 const unsigned char *in, size_t inl)
++{
++	SM4_CTX *ctx = (SM4_CTX*)vctx;
++    if (!ossl_prov_is_running())
++        return 0;
++	int ret = phytium_scto_sm4_update(ctx, in, inl, out);
++	if (ret < 0) return 0;
++	*outl = inl;
++	return 1;
++}
++
++static int sm4ecb_final(void *vctx, unsigned char *out,
++                size_t *outl, size_t outsize)
++{
++	SM4_CTX *ctx = (SM4_CTX*)vctx;
++    if (!ossl_prov_is_running())
++        return 0;
++
++	*outl = SM4_BLOCK_SIZE;
++	return 1;
++}
++
++static int sm4ecb_get_params(OSSL_PARAM params[])
++{
++	return ossl_cipher_generic_get_params(params, 0x1, 0, 128, 128, 0);
++}
++
++
++// 每个密码算法实现需要的基本接口
++const OSSL_DISPATCH phytium_sm4ecb_functions[] = {
++    // 上下文管理
++    { OSSL_FUNC_CIPHER_NEWCTX, (void (*)(void))sm4_newctx },
++    { OSSL_FUNC_CIPHER_FREECTX, (void (*)(void))sm4_freectx },
++    // { OSSL_FUNC_CIPHER_DUPCTX, (void (*)(void))sm4_dupctx },
++
++    // 加密/解密初始化
++    { OSSL_FUNC_CIPHER_ENCRYPT_INIT, (void (*)(void))sm4ecb_einit },
++    { OSSL_FUNC_CIPHER_DECRYPT_INIT, (void (*)(void))sm4ecb_dinit },
++
++    // 数据处理
++    { OSSL_FUNC_CIPHER_UPDATE, (void (*)(void))sm4ecb_update },
++    { OSSL_FUNC_CIPHER_FINAL, (void (*)(void))sm4ecb_final },
++    // { OSSL_FUNC_CIPHER_CIPHER, (void (*)(void))sm4_cipher },
++
++    // 参数管理
++    { OSSL_FUNC_CIPHER_GET_PARAMS, (void (*)(void))sm4ecb_get_params },
++    { OSSL_FUNC_CIPHER_GETTABLE_PARAMS, (void (*)(void))ossl_cipher_generic_gettable_params },
++    // { OSSL_FUNC_CIPHER_GET_CTX_PARAMS, (void (*)(void))sm4_get_ctx_params },
++    // { OSSL_FUNC_CIPHER_GETTABLE_CTX_PARAMS, (void (*)(void))sm4_gettable_ctx_params },
++    // { OSSL_FUNC_CIPHER_SET_CTX_PARAMS, (void (*)(void))sm4_set_ctx_params },
++    // { OSSL_FUNC_CIPHER_SETTABLE_CTX_PARAMS, (void (*)(void))sm4_settable_ctx_params },
++
++    { 0, NULL }
++};
++
++
++static int sm4cbc_einit(void *vctx, const unsigned char *key,
++                        size_t keylen, const unsigned char *iv,
++                        size_t ivlen, const OSSL_PARAM params[])
++{
++	SM4_CTX *ctx = (SM4_CTX*)vctx;
++    if (!ossl_prov_is_running())
++        return 0;
++	int ret = phytium_scto_sm4_init(ctx, SM4_MODE_CBC, SM4_CRYPTO_ENCRYPT, key, iv);
++	if (ret < 0) {
++		return 0;
++	}
++	return 1;
++}
++
++static int sm4cbc_dinit(void *vctx, const unsigned char *key,
++                        size_t keylen, const unsigned char *iv,
++                        size_t ivlen, const OSSL_PARAM params[])
++{
++	SM4_CTX *ctx = (SM4_CTX*)vctx;
++    if (!ossl_prov_is_running())
++        return 0;
++	int ret = phytium_scto_sm4_init(ctx, SM4_MODE_CBC, SM4_CRYPTO_DECRYPT, key, iv);
++	if (ret < 0) {
++		return 0;
++	}
++	return 1;
++}
++
++static int sm4cbc_update(void *vctx, unsigned char *out,
++                 size_t *outl, size_t outsize,
++                 const unsigned char *in, size_t inl)
++{
++	return sm4cbc_update(vctx, out, outl, outsize, in, inl);
++}
++
++static int sm4cbc_final(void *vctx, unsigned char *out,
++                size_t *outl, size_t outsize)
++{
++	return sm4ecb_final(vctx, out, outl, outsize);
++}
++
++static int sm4cbc_get_params(OSSL_PARAM params[])
++{
++	return ossl_cipher_generic_get_params(params, 0x2, 0, 128, 128, 128);
++}
++
++const OSSL_DISPATCH phytium_sm4cbc_functions[] = {
++    // 上下文管理
++    { OSSL_FUNC_CIPHER_NEWCTX, (void (*)(void))sm4_newctx },
++    { OSSL_FUNC_CIPHER_FREECTX, (void (*)(void))sm4_freectx },
++    // { OSSL_FUNC_CIPHER_DUPCTX, (void (*)(void))sm4_dupctx },
++
++    // 加密/解密初始化
++    { OSSL_FUNC_CIPHER_ENCRYPT_INIT, (void (*)(void))sm4cbc_einit },
++    { OSSL_FUNC_CIPHER_DECRYPT_INIT, (void (*)(void))sm4cbc_dinit },
++
++    // 数据处理
++    { OSSL_FUNC_CIPHER_UPDATE, (void (*)(void))sm4cbc_update },
++    { OSSL_FUNC_CIPHER_FINAL, (void (*)(void))sm4cbc_final },
++    // { OSSL_FUNC_CIPHER_CIPHER, (void (*)(void))sm4_cipher },
++
++    // 参数管理
++    { OSSL_FUNC_CIPHER_GET_PARAMS, (void (*)(void))sm4cbc_get_params },
++    { OSSL_FUNC_CIPHER_GETTABLE_PARAMS, (void (*)(void))ossl_cipher_generic_gettable_params },
++    // { OSSL_FUNC_CIPHER_GET_CTX_PARAMS, (void (*)(void))sm4_get_ctx_params },
++    // { OSSL_FUNC_CIPHER_GETTABLE_CTX_PARAMS, (void (*)(void))sm4_gettable_ctx_params },
++    // { OSSL_FUNC_CIPHER_SET_CTX_PARAMS, (void (*)(void))sm4_set_ctx_params },
++    // { OSSL_FUNC_CIPHER_SETTABLE_CTX_PARAMS, (void (*)(void))sm4_settable_ctx_params },
++
++    { 0, NULL }
++};
++
++
++static int sm4ctr_get_params(OSSL_PARAM params[])
++{
++	return ossl_cipher_generic_get_params(params, 0x5, 0, 128, 8, 128);
++}
++
++static int sm4ctr_einit(void *vctx, const unsigned char *key,
++                        size_t keylen, const unsigned char *iv,
++                        size_t ivlen, const OSSL_PARAM params[])
++{
++	SM4_CTX *ctx = (SM4_CTX*)vctx;
++    if (!ossl_prov_is_running())
++        return 0;
++	int ret = phytium_scto_sm4_init(ctx, SM4_MODE_CTR, SM4_CRYPTO_ENCRYPT, key, iv);
++	if (ret < 0) {
++		return 0;
++	}
++	return 1;
++}
++
++static int sm4ctr_dinit(void *vctx, const unsigned char *key,
++                        size_t keylen, const unsigned char *iv,
++                        size_t ivlen, const OSSL_PARAM params[])
++{
++	SM4_CTX *ctx = (SM4_CTX*)vctx;
++    if (!ossl_prov_is_running())
++        return 0;
++	int ret = phytium_scto_sm4_init(ctx, SM4_MODE_CTR, SM4_CRYPTO_DECRYPT, key, iv);
++	if (ret < 0) {
++		return 0;
++	}
++	return 1;
++}
++
++static int sm4ctr_update(void *vctx, unsigned char *out,
++                 size_t *outl, size_t outsize,
++                 const unsigned char *in, size_t inl)
++{
++	return sm4cbc_update(vctx, out, outl, outsize, in, inl);
++}
++
++static int sm4ctr_final(void *vctx, unsigned char *out,
++                size_t *outl, size_t outsize)
++{
++	return sm4ecb_final(vctx, out, outl, outsize);
++}
++
++const OSSL_DISPATCH phytium_sm4ctr_functions[] = {
++    // 上下文管理
++    { OSSL_FUNC_CIPHER_NEWCTX, (void (*)(void))sm4_newctx },
++    { OSSL_FUNC_CIPHER_FREECTX, (void (*)(void))sm4_freectx },
++    // { OSSL_FUNC_CIPHER_DUPCTX, (void (*)(void))sm4_dupctx },
++
++    // 加密/解密初始化
++    { OSSL_FUNC_CIPHER_ENCRYPT_INIT, (void (*)(void))sm4ctr_einit },
++    { OSSL_FUNC_CIPHER_DECRYPT_INIT, (void (*)(void))sm4ctr_dinit },
++
++    // 数据处理
++    { OSSL_FUNC_CIPHER_UPDATE, (void (*)(void))sm4ctr_update },
++    { OSSL_FUNC_CIPHER_FINAL, (void (*)(void))sm4ctr_final },
++    // { OSSL_FUNC_CIPHER_CIPHER, (void (*)(void))sm4_cipher },
++
++    // 参数管理
++    { OSSL_FUNC_CIPHER_GET_PARAMS, (void (*)(void))sm4ctr_get_params },
++    { OSSL_FUNC_CIPHER_GETTABLE_PARAMS, (void (*)(void))ossl_cipher_generic_gettable_params },
++    // { OSSL_FUNC_CIPHER_GET_CTX_PARAMS, (void (*)(void))sm4_get_ctx_params },
++    // { OSSL_FUNC_CIPHER_GETTABLE_CTX_PARAMS, (void (*)(void))sm4_gettable_ctx_params },
++    // { OSSL_FUNC_CIPHER_SET_CTX_PARAMS, (void (*)(void))sm4_set_ctx_params },
++    // { OSSL_FUNC_CIPHER_SETTABLE_CTX_PARAMS, (void (*)(void))sm4_settable_ctx_params },
++
++    { 0, NULL }
++};
+\ No newline at end of file
+Index: b/providers/phytium/sm4_phytium.h
+===================================================================
+--- /dev/null
++++ b/providers/phytium/sm4_phytium.h
+@@ -0,0 +1,111 @@
++// /* SPDX-License-Identifier: GPL-2.0 */
++// #ifndef _SM4_PHYTIUM_H_
++// #define _SM4_PHYTIUM_H_
++
++// #include <stdint.h>
++// #include <stddef.h>
++// #include <openssl/core.h>
++
++// /*register offset*/
++// #define SKE_MODE_OFFSET           (9)
++// #define SKE_CRYPTO_OFFSET         (8)
++// #define SKE_UPDATE_IV_OFFSET      (18)
++// #define SKE_ERR_CFG_OFFSET        (8)
++
++// #define SM4_BLOCK_BYTE_LEN  (16)
++// #define SM4_BLOCK_WORD_LEN  (4)
++// #define SM4_KEY_BYTE_LEN    (16)
++// #define SM4_KEY_WORD_LEN    (4)
++
++// typedef enum {
++// 	SM4_MODE_ECB = 0,
++// 	SM4_MODE_CBC,
++// 	SM4_MODE_CFB,
++// 	SM4_MODE_OFB,
++// 	SM4_MODE_CTR,
++// } sm4_mode_e;
++
++// typedef enum {
++// 	SM4_CRYPTO_ENCRYPT = 0,
++// 	SM4_CRYPTO_DECRYPT,
++// } sm4_crypto_e;
++
++// extern const OSSL_DISPATCH phytium_sm4_functions[];
++
++// int phytium_scto_sm4_init(int *desc_id, uint32_t mode, uint32_t cryptomode, const uint8_t *key, const uint8_t*iv);
++// int phytium_scto_sm4_update(int desc_id, const uint8_t *in, uint32_t len, uint8_t *out);
++
++// struct _sm4_context {
++// 	uint32_t encsk[32]; /* SM4 subkeys */
++// 	uint32_t decsk[32]; /* SM4 subkeys */
++// };
++
++// struct sm4_func {
++// 	void (*sm4_setkey_enc)(struct _sm4_context *ctx, const uint8_t key[16]);
++// 	void (*sm4_setkey_dec)(struct _sm4_context *ctx, const uint8_t key[16]);
++// 	void (*sm4_crypt_ecb_enc)(struct _sm4_context *ctx, size_t length,
++// 				  uint8_t iv[16], const uint8_t *input,
++// 				  uint8_t *output);
++// 	void (*sm4_crypt_ecb_dec)(struct _sm4_context *ctx, size_t length,
++// 				  uint8_t iv[16], const uint8_t *input,
++// 				  uint8_t *output);
++// 	void (*sm4_crypt_cbc_enc)(struct _sm4_context *ctx, size_t length,
++// 				  uint8_t iv[16], const uint8_t *input,
++// 				  uint8_t *output);
++// 	void (*sm4_crypt_cbc_dec)(struct _sm4_context *ctx, size_t length,
++// 				  uint8_t iv[16], const uint8_t *input,
++// 				  uint8_t *output);
++// 	void (*sm4_crypt_ctr)(struct _sm4_context *ctx, size_t length,
++// 			      uint8_t ctr[16], const uint8_t *input,
++// 			      uint8_t *output);
++// };
++
++// void sm4_func_alloc(struct sm4_func *func);
++
++// void sm4_setkey_enc(struct _sm4_context *ctx, const uint8_t key[16]);
++// void sm4_setkey_dec(struct _sm4_context *ctx, const uint8_t key[16]);
++// void sm4_crypt_ctr(struct _sm4_context *ctx, size_t length, uint8_t ctr[16],
++// 		   const uint8_t *input, uint8_t *output);
++
++// void sm4_crypt_ecb_enc(struct _sm4_context *ctx, size_t length, uint8_t iv[16],
++// 		       const uint8_t *input, uint8_t *output);
++
++// void sm4_crypt_ecb_dec(struct _sm4_context *ctx, size_t length, uint8_t iv[16],
++// 		       const uint8_t *input, uint8_t *output);
++
++// void sm4_crypt_cbc_enc(struct _sm4_context *ctx, size_t length, uint8_t iv[16],
++// 		       const uint8_t *input, uint8_t *output);
++
++// void sm4_crypt_cbc_dec(struct _sm4_context *ctx, size_t length, uint8_t iv[16],
++// 		       const uint8_t *input, uint8_t *output);
++
++
++
++// // /*register offset*/
++// // #define SKE_MODE_OFFSET           (9)
++// // #define SKE_CRYPTO_OFFSET         (8)
++// // #define SKE_UPDATE_IV_OFFSET      (18)
++// // #define SKE_ERR_CFG_OFFSET        (8)
++
++// // #define SM4_BLOCK_BYTE_LEN  (16)
++// // #define SM4_BLOCK_WORD_LEN  (4)
++// // #define SM4_KEY_BYTE_LEN    (16)
++// // #define SM4_KEY_WORD_LEN    (4)
++
++// // typedef enum {
++// // 	SM4_MODE_ECB = 0,
++// // 	SM4_MODE_CBC,
++// // 	SM4_MODE_CFB,
++// // 	SM4_MODE_OFB,
++// // 	SM4_MODE_CTR,
++// // } sm4_mode_e;
++
++// // typedef enum {
++// // 	SM4_CRYPTO_ENCRYPT = 0,
++// // 	SM4_CRYPTO_DECRYPT,
++// // } sm4_crypto_e;
++
++// int phytium_scto_sm4_init(int *desc_id, uint32_t mode, uint32_t cryptomode, const uint8_t *key, const uint8_t*iv);
++// int phytium_scto_sm4_update(int desc_id, const uint8_t *in, uint32_t len, uint8_t *out);
++
++// #endif
+Index: b/providers/phytium/scto.c
+===================================================================
+--- /dev/null
++++ b/providers/phytium/scto.c
+@@ -0,0 +1,375 @@
++/*
++ * File Name:phytium_scto.c - Phytium driver for SDK
++ *
++ * Copyright (C) 2020 Phytium Technology Co.,Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ */
++#include <sys/ioctl.h>
++#include <openssl/obj_mac.h>
++#include <openssl/evp.h>
++#include "scto.h"
++#include "smx_common.h"
++#include "sm4_phytium.h"
++#include "sm3_phytium.h"
++
++
++//#include "lib_phytium_log.h"
++
++// int phytium_scto_fd = -1;
++// static void *regs = NULL;
++// uint64_t *phytium_common_info_start = NULL;
++// phytium_scto_context *phytium_desc_start
++// 	[(SCTO_DESC_NUM + 1) * sizeof(phytium_scto_context) / 0x400000 + 1] = {
++// 		NULL
++// 	};
++static volatile mepool_t *
++	mepool[(SCTO_DESC_NUM + 1) * sizeof(mepool_t) / 0x400000 + 1] = { NULL };
++// static void *dma_buf[SCTO_DESC_NUM + 1] = { NULL };
++
++// uint32_t phytium_scto_ske_bigendian = 1;
++// uint32_t phytium_scto_hash_bigendian = 1;
++
++static int check_kernel_version(int fd, struct phy_crypto_kernel_info *info,
++				uint64_t lib_magic)
++{
++	int ret;
++
++	if (!info) {
++		return -1;
++	}
++
++	info->magic_number = lib_magic;
++	info->response = 0;
++	info->reserved = (SCTO_DESC_NUM << 8) + PER_DESC_DMA_BUF_SIZE;
++	ret = ioctl(fd, PHY_CRYPTO_DRIVER_INFO, info);
++	if (!ret) {
++		if (info->magic_number != lib_magic) {
++			fprintf(stderr,"%s is too old, please update it!",
++				     info->magic_number < lib_magic ? "Driver" :
++								      "Lib");
++			return -1;
++		}
++	}
++
++	if (info->response != 1) {
++		fprintf(stderr,"Mismatch lib and kernel module!\r\n");
++		return -1;
++	}
++
++	return ret;
++}
++
++void *phytium_scto_mem_alloc(_SM3_SM4_CTX *ctx)
++{
++	if (ctx->desc_id > SCTO_DESC_NUM) {
++		fprintf(stderr,"mem_alloc error! desc_id:0x%x\n", ctx->desc_id);
++		return NULL;
++	}
++	int id = 0, alloc_offset, retry_count = 0;
++
++RETRY:
++	alloc_offset =
++		__atomic_fetch_add(
++			&mepool[(SCTO_DESC_NUM + 1) * sizeof(mepool_t) /
++				0x400000][(0x400000 / sizeof(mepool_t)) - 1]
++				 .counter,
++			1, __ATOMIC_SEQ_CST) &
++		(SCTO_DESC_NUM - 1);
++
++	id = __atomic_exchange_n(
++		&mepool[alloc_offset / (0x400000 / sizeof(mepool_t))]
++		       [alloc_offset & ((0x400000 / sizeof(mepool_t)) - 1)]
++			       .counter,
++		0, __ATOMIC_SEQ_CST);
++
++	if (id == alloc_offset + 1) {
++		ctx->desc_id = id;
++		return ((phytium_provctx*)(ctx->provctx))->dma_buf[id];
++	} else {
++		if (unlikely(id))
++			fprintf(stderr,
++				"[%d][%d] = error!id:%d, offset:%d  \n",
++				alloc_offset / (0x400000 / sizeof(mepool_t)),
++				alloc_offset &
++					((0x400000 / sizeof(mepool_t)) - 1),
++				id, alloc_offset);
++		if (retry_count++ < SCTO_DESC_NUM)
++			goto RETRY;
++
++		return NULL;
++	}
++}
++
++
++void phytium_scto_mem_free(int desc_id)
++{
++	if (unlikely((desc_id > SCTO_DESC_NUM) || (desc_id <= 0))) {
++		fprintf(stderr,"mem_free error! desc_id:0x%x\n", desc_id);
++		return;
++	}
++
++	mepool[(desc_id - 1) / (0x400000 / sizeof(mepool_t))]
++	      [(desc_id - 1) & ((0x400000 / sizeof(mepool_t)) - 1)]
++		      .counter = (uint32_t)desc_id;
++}
++
++int phytium_scto_lib_scto_init(phytium_provctx *ctx)
++{
++	if (ctx == NULL) return -1;
++	uint64_t i;
++	uint64_t pagesize = getpagesize();
++	struct phy_crypto_kernel_info driver_info = { 0 };
++
++	ctx->scto_fd = open("/dev/dscto", O_RDWR | O_SYNC);
++	if (ctx->scto_fd < 0) {
++		perror("open error");
++		fprintf(stderr,"open scto failed!\n");
++		goto out;
++	}
++
++	if (check_kernel_version(ctx->scto_fd, &driver_info,
++				 PHY_CRYPTO_LIB_MAGIC)) {
++		fprintf(stderr,
++			"Check driver info error, please udpate kernel module!\r\n");
++		close(ctx->scto_fd);
++		return -1;
++	}
++
++	/* 记录大小端 */
++	ctx->scto_ske_bigendian = (driver_info.endian & 0x2) ? 1 : 0;
++	ctx->scto_hash_bigendian = (driver_info.endian & 0x1) ? 1 : 0;
++
++	ctx->regs_addr = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED,
++		    ctx->scto_fd, 0);
++	if (ctx->regs_addr == MAP_FAILED) {
++		fprintf(stderr,"mmap regs failed!\n");
++		goto out;
++	}
++
++	ctx->common_info_start = mmap(NULL, SCTO_DESC_NUM * 8 + 1024,
++					 PROT_READ, MAP_SHARED, ctx->scto_fd,
++					 pagesize);
++	if (ctx->common_info_start == MAP_FAILED) {
++		fprintf(stderr,"mmap common_info_start failed!\n");
++		goto out;
++	}
++
++	for (i = 0;
++	     i <
++	     (SCTO_DESC_NUM + 1) * sizeof(phytium_scto_context) / 0x400000 + 1;
++	     i++) {
++		ctx->scto_desc_start[i] =
++			mmap(NULL, 0x400000, PROT_READ | PROT_WRITE, MAP_SHARED,
++			      ctx->scto_fd, ((0x2ul) | (i << 2)) * pagesize);
++		if (ctx->scto_desc_start[i] == MAP_FAILED) {
++			fprintf(stderr,"mmap desc_start %lu failed!\n", i);
++			goto out;
++		}
++	}
++
++	for (i = 0; i < (SCTO_DESC_NUM + 1) * sizeof(mepool_t) / 0x400000 + 1;
++	     i++) {
++		mepool[i] = mmap(NULL, 0x400000, PROT_READ | PROT_WRITE,
++				 MAP_SHARED,  ctx->scto_fd,
++				 ((0x3ul) | (i << 2)) * pagesize);
++		if (mepool[i] == MAP_FAILED) {
++			fprintf(stderr,"mmap mepool %lu failed!\n", i);
++			goto out;
++		}
++	}
++
++	for (i = 1; i <= SCTO_DESC_NUM; i++) {
++		ctx->dma_buf[i] = mmap(NULL, PER_DESC_DMA_BUF_SIZE,
++				  PROT_READ | PROT_WRITE, MAP_SHARED,
++				  ctx->scto_fd,
++				  ctx->common_info_start[i]);
++		if (ctx->dma_buf[i] == MAP_FAILED) {
++			fprintf(stderr,"mmap dma_buf[%lu] failed!\n", i);
++			goto out;
++		}
++	}
++
++	return 0;
++
++out:
++	if (ctx->scto_fd < 0) {
++		return -1;
++	}
++
++	for (i = 1; i <= SCTO_DESC_NUM; i++) {
++		if (ctx->dma_buf[i]) {
++			munmap(ctx->dma_buf[i], PER_DESC_DMA_BUF_SIZE);
++		}
++	}
++
++	for (i = 0; i < (SCTO_DESC_NUM + 1) * sizeof(mepool_t) / 0x400000 + 1;
++	     i++) {
++		if (mepool[i])
++			munmap((void *)mepool[i], 0x400000);
++	}
++
++	for (i = 0;
++	     i <
++	     (SCTO_DESC_NUM + 1) * sizeof(phytium_scto_context) / 0x400000 + 1;
++	     i++) {
++		if (ctx->scto_desc_start[i])
++			munmap(ctx->scto_desc_start[i], 0x400000);
++	}
++
++	if (ctx->common_info_start)
++		munmap(ctx->common_info_start, SCTO_DESC_NUM * 8 + 1024);
++
++	if (ctx->regs_addr)
++		munmap(ctx->regs_addr, 0x10000);
++
++	close(ctx->scto_fd);
++
++	return -1;
++}
++
++void phytium_scto_lib_scto_exit(phytium_provctx *ctx)
++{
++	int i;
++	for (i = 1; i <= SCTO_DESC_NUM; i++) {
++		if (ctx->dma_buf[i]) {
++			munmap(ctx->dma_buf[i], PER_DESC_DMA_BUF_SIZE);
++		}
++	}
++
++	for (i = 0; i < (SCTO_DESC_NUM + 1) * sizeof(mepool_t) / 0x400000 + 1;
++	     i++) {
++		if (mepool[i])
++			munmap((void *)mepool[i], 0x400000);
++	}
++
++	for (i = 0;
++	     i <
++	     (SCTO_DESC_NUM + 1) * sizeof(phytium_scto_context) / 0x400000 + 1;
++	     i++) {
++		if (ctx->scto_desc_start[i])
++			munmap(ctx->scto_desc_start[i], 0x400000);
++	}
++
++	if (ctx->common_info_start)
++		munmap(ctx->common_info_start, SCTO_DESC_NUM * 8 + 1024);
++
++	if (ctx->regs_addr)
++		munmap(ctx->regs_addr, 0x10000);
++
++	if (ctx->scto_fd < 0) {
++		return;
++	}
++
++	close(ctx->scto_fd);
++}
++
++// int phytium_scto_get_rand_data(unsigned char *buf, int len)
++// {
++// 	int ret_bytes = 0, offset = 0, retry_cnt = 0;
++// 	if (buf == NULL || len == 0 || phytium_scto_fd < 0)
++// 		return -1;
++// 	if (buf) {
++// 		while (offset < len) {
++// retry:
++// 			ret_bytes = read(phytium_scto_fd, buf + offset,
++// 					 len - offset);
++// 			if (ret_bytes > 0) {
++// 				offset += ret_bytes;
++// 				retry_cnt = 0;
++// 			} else if (ret_bytes == 0) {
++// 				retry_cnt++;
++// 				if (retry_cnt >= 10000)
++// 					return offset;
++// 				goto retry;
++// 			} else
++// 				return offset;
++// 		}
++// 	}
++// 	return offset;
++// }
++
++
++// static const unsigned int num_pkey = sizeof(pkey_handle) / sizeof(pkey_handle[0]);
++
++
++// static int scto_cipher_nids[] = {
++// 	NID_sm4_ecb,
++// 	NID_sm4_cbc,
++// 	NID_sm4_ctr,
++// 	NID_sm4_ofb128,
++// 	NID_sm4_cfb128,
++// };
++
++// static int scto_digest_nids[] = {
++// 	NID_sm3,
++// };
++
++// static scto_cipher_handles cipher_handle[] = {
++// 	{
++// 		.type = "skcipher",
++// 		.name = "scto-sm4-ecb",
++// 		.nid = NID_sm4_ecb,
++// 		.iv_size = 0,
++// 		.block_size = SM4_BLOCK_SIZE,
++// 		.key_size = SM4_KEY_SIZE,
++// 		.flags = EVP_CIPH_ECB_MODE | EVP_CIPH_FLAG_DEFAULT_ASN1,
++// 		._hidden = NULL,
++// 	},
++// 	{
++// 		.type = "skcipher",
++// 		.name = "scto-sm4-cbc",
++// 		.nid = NID_sm4_cbc,
++// 		.iv_size = SM4_IV_LEN,
++// 		.block_size = SM4_BLOCK_SIZE,
++// 		.key_size = SM4_KEY_SIZE,
++// 		.flags = EVP_CIPH_CBC_MODE | EVP_CIPH_FLAG_DEFAULT_ASN1,
++// 		._hidden = NULL,
++// 	},
++// 	{
++// 		.type = "skcipher",
++// 		.name = "scto-sm4-ctr",
++// 		.nid = NID_sm4_ctr,
++// 		.iv_size = SM4_IV_LEN,
++// 		.block_size = SM4_BLOCK_SIZE,
++// 		.key_size = SM4_KEY_SIZE,
++// 		.flags = EVP_CIPH_CTR_MODE | EVP_CIPH_FLAG_DEFAULT_ASN1,
++// 		._hidden = NULL,
++// 	},
++// 	{
++// 		.type = "skcipher",
++// 		.name = "scto-sm4-ofb",
++// 		.nid = NID_sm4_ofb128,
++// 		.iv_size = SM4_IV_LEN,
++// 		.block_size = SM4_BLOCK_SIZE,
++// 		.key_size = SM4_KEY_SIZE,
++// 		.flags = EVP_CIPH_OFB_MODE | EVP_CIPH_FLAG_DEFAULT_ASN1,
++// 		._hidden = NULL,
++// 	},
++// 	{
++// 		.type = "skcipher",
++// 		.name = "scto-sm4-cfb",
++// 		.nid = NID_sm4_cfb128,
++// 		.iv_size = SM4_IV_LEN,
++// 		.block_size = SM4_BLOCK_SIZE,
++// 		.key_size = SM4_KEY_SIZE,
++// 		.flags = EVP_CIPH_CFB_MODE | EVP_CIPH_FLAG_DEFAULT_ASN1,
++// 		._hidden = NULL,
++// 	},
++// };
++
++// static scto_digest_handles digest_handle[] = {
++// 	{
++// 		.type = "hash",
++// 		.name = "scto-sm3",
++// 		.pkey_type = NID_sm3WithRSAEncryption,
++// 		.block_size = SM3_BLOCK_SIZE,
++// 		.dgst_size = SM3_DIGEST_LENGTH,
++// 		.flags = EVP_MD_FLAG_DIGALGID_ABSENT,
++// 		._hidden = NULL,
++// 	},
++// };
+Index: b/providers/phytium/scto.h
+===================================================================
+--- /dev/null
++++ b/providers/phytium/scto.h
+@@ -0,0 +1,94 @@
++#ifndef _SCTO_H_
++#define _SCTO_H_
++
++#include "smx_common.h"
++#include <openssl/ec.h>
++#include <openssl/evp.h>
++
++
++#define SCTO_ENGINE_VERSION "1.8.3"
++
++#define unlikely(x)    (__builtin_expect(!!(x), 0))
++#define likely(x)    (__builtin_expect(!!(x), 1))
++
++#define SCTO_SM4_INIT	   0
++#define SCTO_SM4_CIPHER    1
++#define SCTO_SM3_INIT      2
++#define SCTO_SM3_UPDATE    3
++#define SCTO_SM3_FINISH    4
++
++
++// struct cipher_handles {
++// 	const char *type;
++// 	const char *name;
++// 	int nid;
++// 	int iv_size;
++// 	int block_size;
++//     int key_size;
++// 	unsigned long flags;
++//     EVP_CIPHER *_hidden;
++// };
++
++
++// struct digest_handles {
++// 	const char *type;
++// 	const char *name;
++//     int pkey_type;
++//     int block_size;
++//     int dgst_size;
++//     int ctx_size;
++//     unsigned long flags;
++//     EVP_MD *_hidden;
++// };
++
++// typedef struct {
++// 	/* Key and paramgen group */
++// 	EC_GROUP *gen_group;
++// 	/* message digest */
++// 	const EVP_MD *md;
++// 	/* Distinguishing Identifier, ISO/IEC 15946-3 */
++// 	uint8_t *id;
++// 	size_t id_len;
++// 	/* id_set indicates if the 'id' field is set (1) or not (0) */
++// 	int id_set;
++// } SM2_PKEY_CTX;
++
++// struct scto_pkey_handles {
++// 	int nid;
++// 	EVP_PKEY_METHOD *pmeth;
++// };
++
++// static int scto_pkey_nids[] = {
++// 	EVP_PKEY_SM2,
++// };
++
++// static struct scto_pkey_handles pkey_handle[] = {
++// 	{
++// 		.nid = EVP_PKEY_SM2,
++// 		.pmeth = NULL,
++// 	},
++// };
++
++// typedef struct cipher_handles scto_cipher_handles;
++// typedef struct digest_handles scto_digest_handles;
++
++/*
++ * MAGIC Number to identify correct initialisation
++ * of afalg_ctx.
++ */
++# define MAGIC_INIT_NUM 0x1890671
++
++struct scto_ctx_st {
++    int init_done;
++	int sm3_desc_id;
++	int sm4_desc_id;
++};
++
++//typedef struct scto_ctx_st scto_ctx;
++
++int phytium_scto_lib_scto_init(phytium_provctx *ctx);
++void phytium_scto_lib_scto_exit(phytium_provctx *ctx);
++void *phytium_scto_mem_alloc(_SM3_SM4_CTX *ctx);
++void phytium_scto_mem_free(int desc_id);
++
++#endif
+\ No newline at end of file

@@ -45,6 +45,11 @@ ifeq ($(DEB_HOST_ARCH_CPU), amd64)
 	CONFARGS += enable-ec_nistp_64_gcc_128 no-padlockeng
 endif
 
+ifneq (, $(filter aarch64 arm64, $(DEB_HOST_ARCH_CPU)))
+	CONFARGS += enable-phytiumgm -DHOST_ARCH_ARM64
+endif
+
+
 %:
 	dh $@ --without autoreconf
 

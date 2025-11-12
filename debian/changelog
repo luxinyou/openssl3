@@ -1,3 +1,9 @@
+openssl (3.2.4-0deepin6) unstable; urgency=medium
+
+  * support phytium sm provide mechanism.
+
+ -- luxinyou <luxinyou@uniontech.com>  Wed, 12 Nov 2025 18:30:08 +0800
+
 openssl (3.2.4-0deepin5) unstable; urgency=medium
 
   * bugfix Zhaoxin.GM certificate verify error due to without setting default user id.

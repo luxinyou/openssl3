@@ -11,3 +11,4 @@ Add-support-for-Zhaoxin-SM2-3-4-instruction.patch
 deepin-sw64-support.patch
 1000-Support-TLCP-and-GM-T-0024-2014.patch
 bugfix-ZHAOXIN-GM-certificate-verify-error.patch
+uniontech-phytium-custom-gm.patch
